@@ -161,7 +161,7 @@ def pager(prefix: str, page: int, pages: int) -> list:
         return []
     row = []
     if page > 0:
-        row.append(btn("◀️️ Prev", f"{prefix}:{page - 1}", "primary"))
+        row.append(btn("◀ Prev", f"{prefix}:{page - 1}", "primary"))
     row.append(btn(f"Page {page + 1}/{pages}", "noop", "primary"))
     if page < pages - 1:
         row.append(btn("Next ▶️", f"{prefix}:{page + 1}", "primary"))
@@ -320,11 +320,12 @@ async def purchase(user_id: int, item_id: str, user_info: str):
         "created_at": t,
     })
 
+    # Updated admin notification formatting with custom premium emoji and bold tags
     admin_alert = Text(
         CustomEmoji("🛍", custom_emoji_id=config.STORE_EMOJI_ID), " ", Bold("New Product Purchase!"), "\n\n",
         f"<b>Order ID:</b> <code>{oid}</code>\n",
-        f"<b>Buyer:</b> {user_info} (ID: <code>{user_id}</code>)\n",
-        f"<b>Product:</b> {gv_title}\n",
+        f"<b>Buyer:</b> {esc(user_info)} (ID: <code>{user_id}</code>)\n",
+        f"<b>Product:</b> {esc(gv_title)}\n",
         f"<b>Price Paid:</b> {money(cents)}\n",
         f"<b>Remaining User Balance:</b> {money(w['balance_cents'])}"
     )
@@ -417,7 +418,7 @@ async def cmd_start(m: Message, state: FSMContext):
     custom_emoji_id = config.GIFTS_EMOJI_ID
     entities = [MessageEntity(type="custom_emoji", offset=0, length=2, custom_emoji_id=custom_emoji_id)]
     
-    welcome_text = f"🎁  Welcome to {config.STORE_NAME}\n\nSelect an option below to buy Google Voice accounts or manage your wallet balance."
+    welcome_text = f"🎁 Welcome to {config.STORE_NAME}\n\nSelect an option below to buy Google Voice accounts or manage your wallet balance."
     await m.answer(welcome_text, entities=entities, reply_markup=main_menu(m.from_user.id in ADMIN_SET))
 
 
@@ -530,7 +531,7 @@ async def cb_buy_gv(c: CallbackQuery):
     await show(c, text, kb(rows))
 
 
-# ── Top-Up Wallet Workflow (USD Amount -> Currency Selection -> Live Invoice -> Proof Upload) ──
+# ── Top-Up Wallet Workflow ──
 
 
 @user_router.callback_query(F.data == "w")
@@ -570,15 +571,6 @@ async def msg_topup_amount(m: Message, state: FSMContext):
 
     wallets = await get_active_wallets()
     rows = []
-    
-    emoji_map = {
-        "USDT_TRC20": config.USDT_EMOJI_ID,
-        "USDT_BEP20": config.USDT_EMOJI_ID,
-        "USDT_ERC20": config.USDT_EMOJI_ID,
-        "BTC": config.BTC_EMOJI_ID,
-        "ETH": config.ETH_EMOJI_ID,
-        "SOL": config.SOL_EMOJI_ID,
-    }
 
     for key, addr in wallets.items():
         if addr and addr.strip():
@@ -692,7 +684,7 @@ async def msg_topup_proof(m: Message, state: FSMContext):
     admin_text = (
         f"💳 <b>New Deposit Verification Request!</b>\n\n"
         f"<b>ID:</b> <code>{pid}</code>\n"
-        f"<b>User:</b> {u_info} (ID: <code>{m.from_user.id}</code>)\n"
+        f"<b>User:</b> {esc(u_info)} (ID: <code>{m.from_user.id}</code>)\n"
         f"<b>USD Amount:</b> {money(cents)}\n"
         f"<b>Expected Crypto:</b> {crypto_amt}\n"
         f"<b>Currency:</b> {curr}\n"

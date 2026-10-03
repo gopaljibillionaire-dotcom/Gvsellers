@@ -246,6 +246,13 @@ async def init_db():
     await db.orders.create_index("order_id", unique=True)
     await db.orders.create_index([("user_id", A), ("created_at", D)])
     await db.payments.create_index("payment_id", unique=True)
+    
+    # Safely drop conflicting legacy index if present
+    try:
+        await db.payments.drop_index("merchant_trade_no_1")
+    except Exception:
+        pass
+
     await db.wallets.create_index("user_id", unique=True)
     await db.wallet_transactions.create_index([("user_id", A), ("created_at", D)])
     await db.settings.create_index("key", unique=True)
@@ -530,7 +537,7 @@ async def cb_buy_gv(c: CallbackQuery):
     await show(c, text, kb(rows))
 
 
-# ── Top-Up Wallet Workflow (USD Amount -> Currency Selection -> Live Invoice -> Proof Upload) ──
+# ── Top-Up Wallet Workflow ──
 
 
 @user_router.callback_query(F.data == "w")
@@ -639,7 +646,6 @@ async def msg_topup_txnid(m: Message, state: FSMContext):
 
 @user_router.message(TopUpSt.proof_photo, F.photo | F.document)
 async def msg_topup_proof(m: Message, state: FSMContext):
-    # Retrieve photo file_id depending on whether uploaded as standard photo or compressed image document
     photo_id = None
     if m.photo:
         photo_id = m.photo[-1].file_id
@@ -664,6 +670,7 @@ async def msg_topup_proof(m: Message, state: FSMContext):
 
     deposit_doc = {
         "payment_id": pid,
+        "merchant_trade_no": pid,  # Unique identifier prevents Mongo DuplicateKeyError
         "user_id": m.from_user.id,
         "user_info": u_info,
         "amount_cents": cents,
@@ -676,15 +683,18 @@ async def msg_topup_proof(m: Message, state: FSMContext):
     }
     await db.payments.insert_one(deposit_doc)
 
+    # Response sent to the user
+    support_username = getattr(config, "SUPPORT_USERNAME", "").lstrip("@")
+    support_ref = f"@{support_username}" if support_username else "support"
+    
     await m.answer(
-        "✅ <b>Deposit Submission Received!</b>\n\n"
-        f"<b>ID:</b> <code>{pid}</code>\n"
-        f"<b>USD Value:</b> {money(cents)}\n"
-        f"<b>Method:</b> {curr}\n\n"
-        "Admins will verify your payment proof and credit your wallet balance shortly.",
+        "✅ <b>Payment Proof Submitted!</b>\n\n"
+        "⏳ <b>Payment should be processed in 5 to 20 minutes.</b>\n"
+        f"If not, send a message to support ID: {support_ref} or contact support.",
         reply_markup=kb([[back("w")]])
     )
 
+    # Forward verification request with photo to admin bot / admins
     admin_markup = kb([
         [
             btn("✅ Approve", f"adm:app_dep:{pid}", "success"),
@@ -978,7 +988,7 @@ async def cb_view_deposit(c: CallbackQuery):
     await show(c, text, kb(rows))
 
 
-# ── Stock Management (New GV & Old GV) ──
+# ── Stock Management ──
 
 
 @admin_router.callback_query(F.data == "adm:add_choice")

@@ -14,30 +14,30 @@ def _int_list(raw: str, default: list) -> list:
 
 
 # ───────────────────────────── Telegram ─────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "123456:REPLACE_ME")
-ADMIN_IDS = _int_list(os.getenv("ADMIN_IDS", ""), [123456789])  # comma-separated Telegram user IDs
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS = _int_list(os.getenv("ADMIN_IDS", ""), [])  # comma-separated Telegram user IDs
 
 # Support. NOTE: this number is the same value as the support custom-emoji ID, and it is
 # too large to be a real Telegram user ID, so the "Support" button opens SUPPORT_USERNAME.
 # Messages sent through the bot are relayed to SUPPORT_ID if reachable, else to ADMIN_IDS.
-SUPPORT_ID = int(os.getenv("SUPPORT_ID", "5395804191769763641"))
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "your_support_username")  # without @
+SUPPORT_ID = int(os.getenv("SUPPORT_ID", ""))
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "")  # without @
 
 # Telegram custom (premium) emoji IDs
 WALLET_EMOJI_ID = "5256186332669035163"
 SUPPORT_EMOJI_ID = "5395804191769763641"
 
 # ───────────────────────────── MongoDB ──────────────────────────────
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = os.getenv("MONGO_URI", "")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "digital_store")
 
 # ──────────────────────────── Binance Pay ───────────────────────────
 # Merchant API credentials from the Binance Pay merchant dashboard.
 # Admins may override them at runtime from the Payment Settings screen
 # (stored encrypted in MongoDB, always shown masked).
-BINANCE_PAY_API_KEY = os.getenv("BINANCE_PAY_API_KEY", "REPLACE_ME")
-BINANCE_PAY_API_SECRET = os.getenv("BINANCE_PAY_API_SECRET", "REPLACE_ME")
-BINANCE_MERCHANT_ID = os.getenv("BINANCE_MERCHANT_ID", "REPLACE_ME")
+BINANCE_PAY_API_KEY = os.getenv("BINANCE_PAY_API_KEY", "")
+BINANCE_PAY_API_SECRET = os.getenv("BINANCE_PAY_API_SECRET", "")
+BINANCE_MERCHANT_ID = os.getenv("BINANCE_MERCHANT_ID", "")
 BINANCE_API_BASE = os.getenv("BINANCE_API_BASE", "https://bpay.binanceapi.com")
 # Only set True if you are an ISV creating orders for a sub-merchant.
 BINANCE_SEND_MERCHANT_ID = os.getenv("BINANCE_SEND_MERCHANT_ID", "0") == "1"

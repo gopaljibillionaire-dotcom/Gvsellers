@@ -247,7 +247,6 @@ async def init_db():
     await db.orders.create_index([("user_id", A), ("created_at", D)])
     await db.payments.create_index("payment_id", unique=True)
     
-    # Safely drop conflicting legacy index if present
     try:
         await db.payments.drop_index("merchant_trade_no_1")
     except Exception:
@@ -343,13 +342,20 @@ async def purchase(user_id: int, item_id: str, user_info: str):
 def delivery_block(item: dict) -> str:
     dt = item.get("details", {})
     if dt:
+        email = dec(dt.get("email_enc", ""))
+        password = dec(dt.get("pass_enc", ""))
+        rec_email = dec(dt.get("rec_enc", ""))
+        phone_num = dec(dt.get("num_enc", ""))
+        
         return (
-            "📧 <b>Email:</b> <code>" + esc(dec(dt.get("email_enc", ""))) + "</code>\n"
-            "🔑 <b>Password:</b> <code>" + esc(dec(dt.get("pass_enc", ""))) + "</code>\n"
-            "🔄 <b>Recovery Email:</b> <code>" + esc(dec(dt.get("rec_enc", ""))) + "</code>\n"
-            "📞 <b>Phone Number:</b> <code>" + esc(dec(dt.get("num_enc", ""))) + "</code>"
+            "📧 <b>Email:</b> <code>" + esc(email) + "</code>\n"
+            "🔑 <b>Password:</b> <code>" + esc(password) + "</code>\n"
+            "🔄 <b>Recovery Email:</b> <code>" + esc(rec_email) + "</code>\n"
+            "📞 <b>Phone Number:</b> <code>" + esc(phone_num) + "</code>"
         )
-    return f"🔑 <b>Account Details:</b>\n<code>{esc(dec(item.get('code_enc', '')))}</code>"
+    
+    code = dec(item.get('code_enc', ''))
+    return f"🔑 <b>Account Details:</b>\n<code>{esc(code)}</code>"
 
 
 # ═══════════════════════ MIDDLEWARES & STATES ═══════════════════════
@@ -424,7 +430,7 @@ async def cmd_start(m: Message, state: FSMContext):
     custom_emoji_id = config.GIFTS_EMOJI_ID
     entities = [MessageEntity(type="custom_emoji", offset=0, length=2, custom_emoji_id=custom_emoji_id)]
     
-    welcome_text = f"🎁  Welcome to {config.STORE_NAME}\n\nSelect an option below to buy Google Voice accounts or manage your wallet balance."
+    welcome_text = f"🎁 Welcome to {config.STORE_NAME}\n\nSelect an option below to buy Google Voice accounts or manage your wallet balance."
     await m.answer(welcome_text, entities=entities, reply_markup=main_menu(m.from_user.id in ADMIN_SET))
 
 
@@ -450,12 +456,9 @@ async def cb_noop(c: CallbackQuery):
 
 @user_router.callback_query(F.data.startswith("pl:"))
 async def cb_products_list(c: CallbackQuery):
-    new_count = await db.inventory.count_documents({"gv_type": "new", "status": "available"})
-    old_count = await db.inventory.count_documents({"gv_type": "old", "status": "available"})
-
     rows = [
-        [btn(f"🟢 New GV — {money(NEW_GV_PRICE_CENTS)} (Stock: {new_count})", "gvl:new:0", "success")],
-        [btn(f"📜 Old GV — {money(OLD_GV_PRICE_CENTS)} (Stock: {old_count})", "gvl:old:0", "primary")],
+        [btn(f"🟢 New GV — {money(NEW_GV_PRICE_CENTS)}", "gvl:new:0", "success")],
+        [btn(f"📜 Old GV — {money(OLD_GV_PRICE_CENTS)}", "gvl:old:0", "primary")],
         [back()],
     ]
     content = Text(CustomEmoji("📦", custom_emoji_id=config.BOX_EMOJI_ID), " ", Bold("Select Google Voice Category:"))
@@ -670,7 +673,7 @@ async def msg_topup_proof(m: Message, state: FSMContext):
 
     deposit_doc = {
         "payment_id": pid,
-        "merchant_trade_no": pid,  # Unique identifier prevents Mongo DuplicateKeyError
+        "merchant_trade_no": pid,
         "user_id": m.from_user.id,
         "user_info": u_info,
         "amount_cents": cents,
@@ -683,7 +686,6 @@ async def msg_topup_proof(m: Message, state: FSMContext):
     }
     await db.payments.insert_one(deposit_doc)
 
-    # Response sent to the user
     support_username = getattr(config, "SUPPORT_USERNAME", "").lstrip("@")
     support_ref = f"@{support_username}" if support_username else "support"
     
@@ -694,7 +696,6 @@ async def msg_topup_proof(m: Message, state: FSMContext):
         reply_markup=kb([[back("w")]])
     )
 
-    # Forward verification request with photo to admin bot / admins
     admin_markup = kb([
         [
             btn("✅ Approve", f"adm:app_dep:{pid}", "success"),

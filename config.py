@@ -1,10 +1,4 @@
-"""
-config.py — all configuration and secrets for the digital store bot.
 
-Every value can be overridden with an environment variable (handy on Heroku /
-Railway / Docker), otherwise edit the defaults below. Secrets live ONLY here
-(or in env vars) and are never sent to Telegram.
-"""
 import os
 
 
@@ -32,6 +26,7 @@ USDT_EMOJI_ID = "6035288280562404083"         # 💵 USDT
 BTC_EMOJI_ID = "5465465383035083768"          # ₿ Bitcoin
 ETH_EMOJI_ID = "5830292326202741807"          # ⟠ Ethereum
 LTC_EMOJI_ID = "5116097208281727613"          # 🪙 Litecoin
+SOL_EMOJI_ID = "5449658099499547173"          # ☀️ Solana
 WALLET_EMOJI_ID = "5256186332669035163"       # 👛 Wallet
 SUPPORT_EMOJI_ID = "5395804191769763641"      # 🎧 Support
 
@@ -39,32 +34,31 @@ SUPPORT_EMOJI_ID = "5395804191769763641"      # 🎧 Support
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "digital_store")
 
-# ──────────────────────────── Binance Pay ───────────────────────────
-# Merchant API credentials from the Binance Pay merchant dashboard.
-# Admins may override them at runtime from the Payment Settings screen
-# (stored encrypted in MongoDB, always shown masked).
-BINANCE_PAY_API_KEY = os.getenv("BINANCE_PAY_API_KEY", "REPLACE_ME")
-BINANCE_PAY_API_SECRET = os.getenv("BINANCE_PAY_API_SECRET", "REPLACE_ME")
-BINANCE_MERCHANT_ID = os.getenv("BINANCE_MERCHANT_ID", "REPLACE_ME")
-BINANCE_API_BASE = os.getenv("BINANCE_API_BASE", "https://bpay.binanceapi.com")
-# Only set True if you are an ISV creating orders for a sub-merchant.
-BINANCE_SEND_MERCHANT_ID = os.getenv("BINANCE_SEND_MERCHANT_ID", "0") == "1"
+# ────────────────────── Manual Wallet Payments ──────────────────────
+# Static addresses for manual deposit transfers
+WALLETS = {
+    "USDT_TRC20": os.getenv("USDT_TRC20_WALLET", "TEmFazxBnjuxyQF3ohHReJvSghmG1DW2sX"),
+    "USDT_BEP20": os.getenv("USDT_BEP20_WALLET", "0x20c065b69618a09fb8f9ab88e07e09910d9abada"),
+    "USDT_ERC20": os.getenv("USDT_ERC20_WALLET", "0x20c065b69618a09fb8f9ab88e07e09910d9abada"),
+    "BTC": os.getenv("BTC_WALLET", "1KiZw2SmvhWZCY8Rj3bZMifMkkF82BK6UX"),
+    "ETH": os.getenv("ETH_WALLET", "0x20c065b69618a09fb8f9ab88e07e09910d9abada"),
+    "SOL": os.getenv("SOL_WALLET", "9bQPXaQqdZe4XzLeZrPbfJMu7e5sbgDWhNKgifDu4M7Q"),
+}
 
-# Stablecoins only (1 USD = 1 coin), so wallet credit is exact.
-SUPPORTED_CURRENCIES = ["USDT", "USDC", "FDUSD"]
-DEFAULT_ENABLED_CURRENCIES = ["USDT"]
+# Live rate conversion API settings (e.g. CoinGecko API)
+# API IDs used to convert USD deposit amounts to real-time crypto equivalents
+PRICE_API_URL = "https://api.coingecko.com/api/v3/simple/price"
+CURRENCY_PRICE_IDS = {
+    "USDT": "tether",
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+}
+
+SUPPORTED_CURRENCIES = ["USDT_TRC20", "USDT_BEP20", "USDT_ERC20", "BTC", "ETH", "SOL"]
+DEFAULT_ENABLED_CURRENCIES = ["USDT_TRC20", "BTC", "ETH", "SOL"]
 MIN_DEPOSIT = "1.00"     # default minimum deposit (USD), editable in admin panel
 MAX_DEPOSIT = "500.00"   # default maximum deposit (USD), editable in admin panel
-PAYMENT_EXPIRY_MINUTES = 30
-PAYMENT_POLL_SECONDS = 25   # background verification interval
-
-# Optional Binance Pay webhook receiver (a trigger only: the body is never trusted,
-# the order is always re-verified through the signed merchant API).
-# Set WEBHOOK_PORT (e.g. $PORT on a web dyno) and WEBHOOK_PUBLIC_URL to enable.
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "0"))
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/binance/webhook")
-WEBHOOK_PUBLIC_URL = os.getenv("WEBHOOK_PUBLIC_URL", "")  # e.g. https://myapp.example.com/binance/webhook
 
 # ───────────────────────────── Security ─────────────────────────────
 # Fernet key used to encrypt inventory codes and stored credentials at rest.
@@ -84,7 +78,7 @@ TERMS_TEXT = (
     "2. Fraudulent payments, chargeback abuse, unauthorized access and any attempt to "
     "purchase or sell prohibited goods are strictly forbidden and will result in a permanent ban.\n"
     "3. Delivered digital products are non-refundable once revealed, unless the code is proven invalid.\n"
-    "4. Wallet funds are credited only after the payment is verified by the payment provider.\n"
+    "4. Wallet funds are credited only after the payment is verified by the payment provider or store admins.\n"
     "5. We may refuse service or restrict accounts that violate these terms.\n\n"
     "Contact support if you have any questions."
 )

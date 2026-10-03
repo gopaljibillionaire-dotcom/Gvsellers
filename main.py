@@ -1,12 +1,5 @@
 """
-Digital product store bot — Aiogram 3.x + MongoDB (Motor) + Manual Crypto Payments.
-
-Features:
-- New GV ($4.00) & Old GV ($6.00) selection & automated delivery.
-- Manual crypto deposit system with TXN ID & proof photo submission.
-- Admin approval/rejection system for top-ups.
-- Instant admin notifications via bot for purchases & payment verifications.
-- Custom Telegram Premium Emoji integration using config.py.
+Digital product store bot — Aiogram 3.x + MongoDB (Motor) + Crypto API Payments.
 """
 from __future__ import annotations
 
@@ -29,7 +22,13 @@ from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    MessageEntity,
+)
 from aiogram.utils.formatting import Bold, CustomEmoji, Text
 from cryptography.fernet import Fernet, InvalidToken
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -45,11 +44,10 @@ MAX_PRICE_CENTS = 10_000_000
 mongo: Any = None
 db: Any = None
 bot_ref: Optional[Bot] = None
-_tasks: set = set()
 
-# Fixed Prices in Cents
 NEW_GV_PRICE_CENTS = 400  # $4.00
 OLD_GV_PRICE_CENTS = 600  # $6.00
+
 
 # ════════════════════════════ HELPERS ════════════════════════════
 
@@ -113,6 +111,25 @@ def dec(s: str) -> str:
         return ""
 
 
+async def fetch_crypto_price(coin_id: str) -> Optional[float]:
+    """Fetch live crypto rate in USD from CoinGecko API."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            params = {"ids": coin_id, "vs_currencies": "usd"}
+            async with session.get(config.PRICE_API_URL, params=params, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get(coin_id, {}).get("usd")
+    except Exception as e:
+        log.error("Error fetching crypto price: %s", e)
+    return None
+
+
+async def get_active_wallets() -> dict:
+    wallets = await get_setting("wallets", config.WALLETS)
+    return wallets
+
+
 # ════════════════════════════ KEYBOARDS & STYLING ════════════════════════════
 
 
@@ -144,7 +161,7 @@ def pager(prefix: str, page: int, pages: int) -> list:
         return []
     row = []
     if page > 0:
-        row.append(btn("◀️ Prev", f"{prefix}:{page - 1}", "primary"))
+        row.append(btn("◀️️ Prev", f"{prefix}:{page - 1}", "primary"))
     row.append(btn(f"Page {page + 1}/{pages}", "noop", "primary"))
     if page < pages - 1:
         row.append(btn("Next ▶️", f"{prefix}:{page + 1}", "primary"))
@@ -153,7 +170,7 @@ def pager(prefix: str, page: int, pages: int) -> list:
 
 def main_menu(admin: bool) -> InlineKeyboardMarkup:
     rows = [
-        [btn("🛍 View Products", "pl:0", "success")],
+        [btn("🛍 Buy Google Voice", "pl:0", "success")],
         [btn("💰 Wallet", "w", "success"), btn("📦 My Orders", "ol:0", "primary")],
         [btn("💬 Contact Support", "sup", "success"), btn("📜 Terms", "terms", "primary")],
     ]
@@ -162,10 +179,14 @@ def main_menu(admin: bool) -> InlineKeyboardMarkup:
     return kb(rows)
 
 
-async def show(ev, text: Optional[str] = None, markup=None, content: Optional[Text] = None, plain: bool = False):
+async def show(ev, text: Optional[str] = None, markup=None, content: Optional[Text] = None, plain: bool = False, entities: list = None):
     kwargs: dict = content.as_kwargs() if content is not None else {"text": text}
     if plain and content is None:
         kwargs["parse_mode"] = None
+    if entities:
+        kwargs["entities"] = entities
+        kwargs.pop("parse_mode", None)
+
     if isinstance(ev, CallbackQuery):
         try:
             await ev.message.edit_text(**kwargs, reply_markup=markup)
@@ -220,7 +241,6 @@ async def init_db():
     await mongo.admin.command("ping")
     A, D = ASCENDING, DESCENDING
     await db.users.create_index("user_id", unique=True)
-    await db.products.create_index("product_id", unique=True)
     await db.inventory.create_index("item_id", unique=True)
     await db.inventory.create_index([("status", A), ("gv_type", A)])
     await db.orders.create_index("order_id", unique=True)
@@ -229,9 +249,6 @@ async def init_db():
     await db.wallets.create_index("user_id", unique=True)
     await db.wallet_transactions.create_index([("user_id", A), ("created_at", D)])
     await db.settings.create_index("key", unique=True)
-    await db.admins.create_index("user_id", unique=True)
-    for aid in ADMIN_SET:
-        await db.admins.update_one({"user_id": aid}, {"$setOnInsert": {"added_at": now()}}, upsert=True)
 
 
 async def get_setting(key: str, default: Any = None) -> Any:
@@ -249,13 +266,6 @@ async def get_balance(user_id: int) -> int:
 
 
 # ═══════════════════════════ INVENTORY & PURCHASES ═══════════════════════════
-
-
-async def release_item(item_id: str):
-    await db.inventory.update_one(
-        {"item_id": item_id, "status": "reserved"},
-        {"$unset": {"order_id": "", "buyer_id": "", "reserved_at": ""}, "$set": {"status": "available"}},
-    )
 
 
 async def purchase(user_id: int, item_id: str, user_info: str):
@@ -282,11 +292,11 @@ async def purchase(user_id: int, item_id: str, user_info: str):
         return_document=ReturnDocument.AFTER,
     )
     if not w:
-        await release_item(item_id)
+        await db.inventory.update_one({"item_id": item_id}, {"$set": {"status": "available"}, "$unset": {"order_id": "", "buyer_id": ""}})
         return None, None, f"Insufficient balance. You need {money(cents)}."
 
     await db.inventory.update_one({"item_id": item_id}, {"$set": {"status": "sold", "sold_at": t}})
-    
+
     order = {
         "order_id": oid,
         "user_id": user_id,
@@ -310,7 +320,6 @@ async def purchase(user_id: int, item_id: str, user_info: str):
         "created_at": t,
     })
 
-    # Alert Admins when a GV purchase occurs
     admin_alert = Text(
         CustomEmoji("🛍", custom_emoji_id=config.STORE_EMOJI_ID), " ", Bold("New Product Purchase!"), "\n\n",
         f"<b>Order ID:</b> <code>{oid}</code>\n",
@@ -363,11 +372,16 @@ class IsAdmin(BaseFilter):
         return bool(u and u.id in ADMIN_SET)
 
 
-class ManualDepositSt(StatesGroup):
-    currency = State()
+class TopUpSt(StatesGroup):
     amount = State()
+    currency = State()
     txn_id = State()
     proof_photo = State()
+
+
+class AdminWalletSt(StatesGroup):
+    currency_key = State()
+    address = State()
 
 
 class AddStockFreshGV(StatesGroup):
@@ -400,12 +414,11 @@ admin_router.callback_query.filter(IsAdmin())
 @user_router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
-    welcome = Text(
-        CustomEmoji("🛍", custom_emoji_id=config.STORE_EMOJI_ID), " ",
-        Bold(f"Welcome to {config.STORE_NAME}"), "\n\n",
-        "Select an option below to buy Google Voice accounts or manage your wallet balance."
-    )
-    await m.answer(**welcome.as_kwargs(), reply_markup=main_menu(m.from_user.id in ADMIN_SET))
+    custom_emoji_id = config.GIFTS_EMOJI_ID
+    entities = [MessageEntity(type="custom_emoji", offset=0, length=2, custom_emoji_id=custom_emoji_id)]
+    
+    welcome_text = f"🎁  Welcome to {config.STORE_NAME}\n\nSelect an option below to buy Google Voice accounts or manage your wallet balance."
+    await m.answer(welcome_text, entities=entities, reply_markup=main_menu(m.from_user.id in ADMIN_SET))
 
 
 @user_router.callback_query(F.data == "home")
@@ -480,7 +493,7 @@ async def cb_gv_item_view(c: CallbackQuery):
     text = (
         f"🛍 <b>Item Selection: {gv_title}</b>\n\n"
         f"Price: <b>{money(cents)}</b>\n"
-        f"Your Wallet Balance: <b>{money(bal)}</b>\n\n"
+        f"Your Balance: <b>{money(bal)}</b>\n\n"
         "<i>Account credentials will be revealed upon checkout.</i>"
     )
 
@@ -517,7 +530,7 @@ async def cb_buy_gv(c: CallbackQuery):
     await show(c, text, kb(rows))
 
 
-# ── Wallet Management & Manual Crypto Top-Up ──
+# ── Top-Up Wallet Workflow (USD Amount -> Currency Selection -> Live Invoice -> Proof Upload) ──
 
 
 @user_router.callback_query(F.data == "w")
@@ -529,14 +542,33 @@ async def cb_wallet(c: CallbackQuery, state: FSMContext):
         "\n\nCurrent Balance: ", Bold(money(bal)),
     )
     await show(c, content=content, markup=kb([
-        [btn("➕ Top Up Balance", "wd_sel", "success"), btn("📜 Transactions", "wt:0", "primary")],
+        [btn("➕ Top Up Balance", "tu_start", "success"), btn("📜 Transactions", "wt:0", "primary")],
         [back()],
     ]))
 
 
-@user_router.callback_query(F.data == "wd_sel")
-async def cb_deposit_select_currency(c: CallbackQuery, state: FSMContext):
+@user_router.callback_query(F.data == "tu_start")
+async def cb_topup_start(c: CallbackQuery, state: FSMContext):
     await state.clear()
+    await state.set_state(TopUpSt.amount)
+    await show(
+        c,
+        f"💵 <b>Enter Deposit Amount (in USD)</b>\n\nExample: Type <code>10</code> or <code>10.00</code>:\nMinimum Deposit: <b>${config.MIN_DEPOSIT}</b>",
+        kb([[cancel_btn("w")]])
+    )
+
+
+@user_router.message(TopUpSt.amount, F.text)
+async def msg_topup_amount(m: Message, state: FSMContext):
+    cents = parse_money(m.text)
+    min_cents = int(Decimal(config.MIN_DEPOSIT) * 100)
+    if cents is None or cents < min_cents:
+        return await m.answer(f"❌ Invalid amount. Minimum deposit is ${config.MIN_DEPOSIT}.", reply_markup=kb([[cancel_btn("w")]]))
+
+    await state.update_data(amount_cents=cents)
+    await state.set_state(TopUpSt.currency)
+
+    wallets = await get_active_wallets()
     rows = []
     
     emoji_map = {
@@ -548,58 +580,74 @@ async def cb_deposit_select_currency(c: CallbackQuery, state: FSMContext):
         "SOL": config.SOL_EMOJI_ID,
     }
 
-    for curr in config.SUPPORTED_CURRENCIES:
-        if curr in config.WALLETS:
-            rows.append([btn(f"💵 Pay with {curr}", f"mdept:{curr}", "primary")])
+    for key, addr in wallets.items():
+        if addr and addr.strip():
+            rows.append([btn(f"Pay with {key}", f"tu_curr:{key}", "primary")])
 
-    rows.append([back("w")])
-    await show(c, "💳 <b>Select Deposit Payment Currency:</b>", kb(rows))
+    if not rows:
+        return await m.answer("❌ No wallet addresses available. Please contact support.", reply_markup=kb([[back("w")]]))
+
+    rows.append([cancel_btn("w")])
+    await m.answer(f"💳 You chose <b>{money(cents)}</b>.\n\nSelect payment method:", reply_markup=kb(rows))
 
 
-@user_router.callback_query(F.data.startswith("mdept:"))
-async def cb_deposit_currency_chosen(c: CallbackQuery, state: FSMContext):
+@user_router.callback_query(TopUpSt.currency, F.data.startswith("tu_curr:"))
+async def cb_topup_currency(c: CallbackQuery, state: FSMContext):
     curr = c.data.split(":")[1]
-    wallet_addr = config.WALLETS.get(curr, "Contact Admin")
+    data = await state.get_data()
+    cents = data["amount_cents"]
+    usd_val = cents / 100.0
 
-    await state.update_data(currency=curr)
-    await state.set_state(ManualDepositSt.amount)
+    wallets = await get_active_wallets()
+    wallet_addr = wallets.get(curr)
+
+    if not wallet_addr:
+        return await alert(c, "Selected currency unavailable.")
+
+    coin_id = config.CURRENCY_PRICE_IDS.get(curr, "bitcoin")
+    price = await fetch_crypto_price(coin_id)
+
+    if price and price > 0:
+        crypto_amount = round(usd_val / price, 6)
+        formatted_crypto = f"{crypto_amount:.6f} {curr.split('_')[0]}"
+    else:
+        formatted_crypto = f"Calculate equivalent for {money(cents)}"
+
+    await state.update_data(currency=curr, crypto_amount=formatted_crypto, wallet_addr=wallet_addr)
+    await state.set_state(TopUpSt.txn_id)
 
     text = (
-        f"💵 <b>Deposit via {curr}</b>\n\n"
-        f"Send funds to address:\n<code>{wallet_addr}</code>\n\n"
-        f"Enter deposit amount in USD (e.g. <code>10.00</code>):"
-    )
-    await show(c, text, kb([[cancel_btn("w")]]))
-
-
-@user_router.message(ManualDepositSt.amount, F.text)
-async def msg_deposit_amount(m: Message, state: FSMContext):
-    cents = parse_money(m.text)
-    if cents is None or cents < int(Decimal(config.MIN_DEPOSIT) * 100):
-        return await m.answer(f"❌ Invalid amount. Minimum deposit is {config.CURRENCY_SYMBOL}{config.MIN_DEPOSIT}.", reply_markup=kb([[cancel_btn("w")]]))
-
-    await state.update_data(amount_cents=cents)
-    await state.set_state(ManualDepositSt.txn_id)
-
-    await m.answer(
-        "✏️ Please send/paste the <b>Transaction Hash / TXN ID</b> of your payment:",
-        reply_markup=kb([[cancel_btn("w")]])
+        f"🧾 <b>Payment Invoice Created</b>\n\n"
+        f"<b>Amount Owed:</b> <code>{formatted_crypto}</code> (${usd_val:.2f} USD)\n\n"
+        f"<b>Send Payment to Address:</b>\n<code>{wallet_addr}</code>\n\n"
+        f"<i>Send the exact amount above. After sending, click 'I Have Paid' below.</i>"
     )
 
+    rows = [
+        [btn("✅ I Have Paid", "tu_paid", "success")],
+        [cancel_btn("w")]
+    ]
+    await show(c, text, kb(rows))
 
-@user_router.message(ManualDepositSt.txn_id, F.text)
-async def msg_deposit_txnid(m: Message, state: FSMContext):
+
+@user_router.callback_query(TopUpSt.txn_id, F.data == "tu_paid")
+async def cb_topup_paid(c: CallbackQuery):
+    await show(c, "✏️ Please type or paste your <b>Transaction Hash / TXN ID</b>:", kb([[cancel_btn("w")]]))
+
+
+@user_router.message(TopUpSt.txn_id, F.text)
+async def msg_topup_txnid(m: Message, state: FSMContext):
     await state.update_data(txn_id=m.text.strip())
-    await state.set_state(ManualDepositSt.proof_photo)
+    await state.set_state(TopUpSt.proof_photo)
 
     await m.answer(
-        "📸 Please upload a <b>screenshot / photo proof</b> of your completed transaction:",
+        "📸 Please send a <b>screenshot / photo proof</b> of your completed transaction:",
         reply_markup=kb([[cancel_btn("w")]])
     )
 
 
-@user_router.message(ManualDepositSt.proof_photo, F.photo)
-async def msg_deposit_proof(m: Message, state: FSMContext):
+@user_router.message(TopUpSt.proof_photo, F.photo)
+async def msg_topup_proof(m: Message, state: FSMContext):
     data = await state.get_data()
     await state.clear()
 
@@ -607,6 +655,7 @@ async def msg_deposit_proof(m: Message, state: FSMContext):
     pid = new_id("DEP", 6)
     cents = data["amount_cents"]
     curr = data["currency"]
+    crypto_amt = data.get("crypto_amount", "N/A")
     txid = data["txn_id"]
     u_info = f"@{m.from_user.username}" if m.from_user.username else m.from_user.first_name
 
@@ -616,6 +665,7 @@ async def msg_deposit_proof(m: Message, state: FSMContext):
         "user_info": u_info,
         "amount_cents": cents,
         "currency": curr,
+        "crypto_amount": crypto_amt,
         "txn_id": txid,
         "photo_id": photo_id,
         "status": "pending",
@@ -623,16 +673,15 @@ async def msg_deposit_proof(m: Message, state: FSMContext):
     }
     await db.payments.insert_one(deposit_doc)
 
-    # Confirm to User
     await m.answer(
-        "✅ <b>Deposit Request Submitted!</b>\n\n"
+        "✅ <b>Deposit Submission Received!</b>\n\n"
         f"<b>ID:</b> <code>{pid}</code>\n"
-        f"<b>Amount:</b> {money(cents)} ({curr})\n\n"
-        "Admins will verify your payment and credit your balance shortly.",
+        f"<b>USD Value:</b> {money(cents)}\n"
+        f"<b>Method:</b> {curr}\n\n"
+        "Admins will verify your payment proof and credit your wallet balance shortly.",
         reply_markup=kb([[back("w")]])
     )
 
-    # Dispatch Verification Notification to Admin
     admin_markup = kb([
         [
             btn("✅ Approve", f"adm:app_dep:{pid}", "success"),
@@ -641,10 +690,11 @@ async def msg_deposit_proof(m: Message, state: FSMContext):
     ])
 
     admin_text = (
-        f"💳 <b>New Manual Top-Up Request!</b>\n\n"
-        f"<b>Deposit ID:</b> <code>{pid}</code>\n"
+        f"💳 <b>New Deposit Verification Request!</b>\n\n"
+        f"<b>ID:</b> <code>{pid}</code>\n"
         f"<b>User:</b> {u_info} (ID: <code>{m.from_user.id}</code>)\n"
-        f"<b>Amount:</b> {money(cents)}\n"
+        f"<b>USD Amount:</b> {money(cents)}\n"
+        f"<b>Expected Crypto:</b> {crypto_amt}\n"
         f"<b>Currency:</b> {curr}\n"
         f"<b>TXN ID:</b> <code>{esc(txid)}</code>"
     )
@@ -668,7 +718,7 @@ async def cb_transactions(c: CallbackQuery):
     await show(c, text, kb(pager("wt", page, pages) + [[back("w")]]))
 
 
-# ── Orders & Info ──
+# ── Orders & Support ──
 
 
 @user_router.callback_query(F.data.startswith("ol:"))
@@ -747,7 +797,7 @@ def admin_menu() -> InlineKeyboardMarkup:
     return kb([
         [btn("➕ Add Stock", "adm:add_choice", "success"), btn("📦 Active Stock", "adm:ai:0", "primary")],
         [btn("🛒 Sold Stock", "adm:ss:0", "primary"), btn("💳 Pending Deposits", "adm:pd:0", "primary")],
-        [btn("👥 Users", "adm:us:0", "primary"), btn("📊 Statistics", "adm:st", "primary")],
+        [btn("⚙️ Manage Wallets", "adm:wallets", "primary"), btn("📊 Statistics", "adm:st", "primary")],
         [btn("📝 Terms", "adm:tm", "primary")],
         [back("home")],
     ])
@@ -765,7 +815,47 @@ async def cb_admin_home(c: CallbackQuery, state: FSMContext):
     await show(c, "⚙️ <b>Admin Control Panel</b>", admin_menu())
 
 
-# ── Manual Deposit Approvals ──
+# ── Admin Dynamic Wallet Management ──
+
+
+@admin_router.callback_query(F.data == "adm:wallets")
+async def cb_admin_wallets(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    wallets = await get_active_wallets()
+    lines = ["⚙️ <b>Wallet Addresses Management</b>\n"]
+    rows = []
+
+    for key, addr in wallets.items():
+        lines.append(f"• <b>{key}:</b>\n<code>{addr}</code>\n")
+        rows.append([btn(f"Edit {key}", f"adm:ewallet:{key}", "primary")])
+
+    rows.append([back("adm:home")])
+    await show(c, "\n".join(lines), kb(rows))
+
+
+@admin_router.callback_query(F.data.startswith("adm:ewallet:"))
+async def cb_admin_edit_wallet(c: CallbackQuery, state: FSMContext):
+    key = c.data.split(":")[2]
+    await state.update_data(currency_key=key)
+    await state.set_state(AdminWalletSt.address)
+    await show(c, f"✏️ Send new address for <b>{key}</b>:", kb([[cancel_btn("adm:wallets")]]))
+
+
+@admin_router.message(AdminWalletSt.address, F.text)
+async def msg_admin_wallet_save(m: Message, state: FSMContext):
+    data = await state.get_data()
+    key = data["currency_key"]
+    new_addr = m.text.strip()
+    await state.clear()
+
+    wallets = await get_active_wallets()
+    wallets[key] = new_addr
+    await set_setting("wallets", wallets)
+
+    await m.answer(f"✅ Wallet for <b>{key}</b> updated successfully!\n\nNew Address:\n<code>{new_addr}</code>", reply_markup=kb([[back("adm:wallets")]]))
+
+
+# ── Deposit Approvals ──
 
 
 @admin_router.callback_query(F.data.startswith("adm:app_dep:"))
@@ -779,7 +869,6 @@ async def cb_approve_deposit(c: CallbackQuery):
     if not pay:
         return await alert(c, "Deposit already processed or expired.")
 
-    # Credit Balance
     w = await db.wallets.find_one_and_update(
         {"user_id": pay["user_id"]},
         {"$inc": {"balance_cents": pay["amount_cents"]}, "$set": {"updated_at": now()}},
@@ -798,7 +887,6 @@ async def cb_approve_deposit(c: CallbackQuery):
         "created_at": now(),
     })
 
-    # Notify User
     content = Text(
         CustomEmoji("💰", custom_emoji_id=config.WALLET_EMOJI_ID), " ", Bold("Deposit Approved!"),
         f"\n\n{money(pay['amount_cents'])} added to your wallet.\nNew Balance: ", Bold(money(w["balance_cents"])),
@@ -850,8 +938,9 @@ async def cb_view_deposit(c: CallbackQuery):
     text = (
         f"💳 <b>Deposit Request:</b> <code>{p['payment_id']}</code>\n\n"
         f"User: {p.get('user_info')} (ID: <code>{p['user_id']}</code>)\n"
-        f"Amount: <b>{money(p['amount_cents'])}</b>\n"
+        f"USD Amount: <b>{money(p['amount_cents'])}</b>\n"
         f"Currency: {p['currency']}\n"
+        f"Expected Crypto: {p.get('crypto_amount', 'N/A')}\n"
         f"TXN ID: <code>{esc(p['txn_id'])}</code>\n"
         f"Status: {p['status']}"
     )
@@ -1007,16 +1096,6 @@ async def cb_sold_stock(c: CallbackQuery):
     await show(c, f"🛒 <b>Sold Products History</b> ({total}):", kb(rows))
 
 
-@admin_router.callback_query(F.data.startswith("adm:us:"))
-async def cb_admin_users(c: CallbackQuery):
-    page = to_int(c.data.split(":")[2])
-    docs, page, pages, total = await page_query(db.users, {}, [("created_at", -1)], page, size=PAGE_10)
-    rows = [[btn(f"User {u['user_id']} (@{u.get('username', 'N/A')})", "noop", "primary")] for u in docs]
-    rows += pager("adm:us", page, pages)
-    rows.append([back("adm:home")])
-    await show(c, f"👥 <b>Total Registered Users:</b> {total}", kb(rows))
-
-
 @admin_router.callback_query(F.data == "adm:st")
 async def cb_admin_stats(c: CallbackQuery):
     users = await db.users.count_documents({})
@@ -1070,7 +1149,7 @@ async def main():
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        log.info("Bot started successfully in Manual Payment Mode.")
+        log.info("Bot started successfully in Crypto Deposit Mode.")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await bot.session.close()

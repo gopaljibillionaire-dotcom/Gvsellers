@@ -320,12 +320,11 @@ async def purchase(user_id: int, item_id: str, user_info: str):
         "created_at": t,
     })
 
-    # Updated admin notification formatting with custom premium emoji and bold tags
     admin_alert = Text(
         CustomEmoji("🛍", custom_emoji_id=config.STORE_EMOJI_ID), " ", Bold("New Product Purchase!"), "\n\n",
         f"<b>Order ID:</b> <code>{oid}</code>\n",
-        f"<b>Buyer:</b> {esc(user_info)} (ID: <code>{user_id}</code>)\n",
-        f"<b>Product:</b> {esc(gv_title)}\n",
+        f"<b>Buyer:</b> {user_info} (ID: <code>{user_id}</code>)\n",
+        f"<b>Product:</b> {gv_title}\n",
         f"<b>Price Paid:</b> {money(cents)}\n",
         f"<b>Remaining User Balance:</b> {money(w['balance_cents'])}"
     )
@@ -418,7 +417,7 @@ async def cmd_start(m: Message, state: FSMContext):
     custom_emoji_id = config.GIFTS_EMOJI_ID
     entities = [MessageEntity(type="custom_emoji", offset=0, length=2, custom_emoji_id=custom_emoji_id)]
     
-    welcome_text = f"🎁 Welcome to {config.STORE_NAME}\n\nSelect an option below to buy Google Voice accounts or manage your wallet balance."
+    welcome_text = f"🎁  Welcome to {config.STORE_NAME}\n\nSelect an option below to buy Google Voice accounts or manage your wallet balance."
     await m.answer(welcome_text, entities=entities, reply_markup=main_menu(m.from_user.id in ADMIN_SET))
 
 
@@ -531,7 +530,7 @@ async def cb_buy_gv(c: CallbackQuery):
     await show(c, text, kb(rows))
 
 
-# ── Top-Up Wallet Workflow ──
+# ── Top-Up Wallet Workflow (USD Amount -> Currency Selection -> Live Invoice -> Proof Upload) ──
 
 
 @user_router.callback_query(F.data == "w")
@@ -638,12 +637,24 @@ async def msg_topup_txnid(m: Message, state: FSMContext):
     )
 
 
-@user_router.message(TopUpSt.proof_photo, F.photo)
+@user_router.message(TopUpSt.proof_photo, F.photo | F.document)
 async def msg_topup_proof(m: Message, state: FSMContext):
+    # Retrieve photo file_id depending on whether uploaded as standard photo or compressed image document
+    photo_id = None
+    if m.photo:
+        photo_id = m.photo[-1].file_id
+    elif m.document and m.document.mime_type and m.document.mime_type.startswith("image/"):
+        photo_id = m.document.file_id
+
+    if not photo_id:
+        return await m.answer(
+            "❌ Invalid format. Please send an image/screenshot as proof.",
+            reply_markup=kb([[cancel_btn("w")]])
+        )
+
     data = await state.get_data()
     await state.clear()
 
-    photo_id = m.photo[-1].file_id
     pid = new_id("DEP", 6)
     cents = data["amount_cents"]
     curr = data["currency"]
@@ -684,7 +695,7 @@ async def msg_topup_proof(m: Message, state: FSMContext):
     admin_text = (
         f"💳 <b>New Deposit Verification Request!</b>\n\n"
         f"<b>ID:</b> <code>{pid}</code>\n"
-        f"<b>User:</b> {esc(u_info)} (ID: <code>{m.from_user.id}</code>)\n"
+        f"<b>User:</b> {u_info} (ID: <code>{m.from_user.id}</code>)\n"
         f"<b>USD Amount:</b> {money(cents)}\n"
         f"<b>Expected Crypto:</b> {crypto_amt}\n"
         f"<b>Currency:</b> {curr}\n"
@@ -693,9 +704,20 @@ async def msg_topup_proof(m: Message, state: FSMContext):
 
     for aid in ADMIN_SET:
         try:
-            await bot_ref.send_photo(aid, photo=photo_id, caption=admin_text, reply_markup=admin_markup)
+            if m.photo:
+                await bot_ref.send_photo(aid, photo=photo_id, caption=admin_text, reply_markup=admin_markup, parse_mode=ParseMode.HTML)
+            else:
+                await bot_ref.send_document(aid, document=photo_id, caption=admin_text, reply_markup=admin_markup, parse_mode=ParseMode.HTML)
         except TelegramAPIError as e:
-            log.warning("Failed sending photo to admin %s: %s", aid, e)
+            log.warning("Failed sending payment proof to admin %s: %s", aid, e)
+
+
+@user_router.message(TopUpSt.proof_photo)
+async def msg_topup_proof_invalid(m: Message):
+    await m.answer(
+        "⚠️ Please upload a valid image screenshot of your payment proof.",
+        reply_markup=kb([[cancel_btn("w")]])
+    )
 
 
 @user_router.callback_query(F.data.startswith("wt:"))
@@ -944,10 +966,14 @@ async def cb_view_deposit(c: CallbackQuery):
 
     if p.get("photo_id"):
         try:
-            await bot_ref.send_photo(c.from_user.id, photo=p["photo_id"], caption=text, reply_markup=kb(rows))
+            await bot_ref.send_photo(c.from_user.id, photo=p["photo_id"], caption=text, reply_markup=kb(rows), parse_mode=ParseMode.HTML)
             return
         except TelegramAPIError:
-            pass
+            try:
+                await bot_ref.send_document(c.from_user.id, document=p["photo_id"], caption=text, reply_markup=kb(rows), parse_mode=ParseMode.HTML)
+                return
+            except TelegramAPIError:
+                pass
 
     await show(c, text, kb(rows))
 

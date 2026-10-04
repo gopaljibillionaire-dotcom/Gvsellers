@@ -1,7 +1,6 @@
 """
 Digital product store bot — Aiogram 3.x + MongoDB (Motor) + Crypto API Payments.
-Includes complete inventory deletion (Single & Bulk Delete) + Data Usage Tracking.
-Updated: Parsing enforces 4 mandatory components (Email, Password, Recovery, Phone Number).
+Includes complete inventory deletion (Single & Bulk Delete) + Data Usage Tracking + Dynamic Banner Images.
 """
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Optional
 
 import aiohttp
-import psutil  # Data usage tracking
+import psutil
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -30,8 +29,8 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
-    MessageEntity,
 )
 from aiogram.utils.formatting import Bold, CustomEmoji, Text
 from cryptography.fernet import Fernet, InvalidToken
@@ -51,6 +50,14 @@ bot_ref: Optional[Bot] = None
 
 NEW_GV_PRICE_CENTS = 400  # $4.00
 OLD_GV_PRICE_CENTS = 600  # $6.00
+
+# Image Banners
+IMG_WELCOME = "https://i.ibb.co/3mMm5pk8/file-00000000304481fabc208d5a014f5b11.png"
+IMG_BUY_GV = "https://i.ibb.co/qFBDtRMT/file-00000000543c821195d09ed80ad42f1c.png"
+IMG_WALLET = "https://i.ibb.co/xKhG0g3D/file-00000000b8b48211b02df47384536e56.png"
+IMG_ORDERS = "https://i.ibb.co/Z6NpMbWG/file-0000000056e081fa90ef2c05289f9691.png"
+IMG_SUPPORT = "https://i.ibb.co/Bxy6JP8/file-0000000024bc8210a4acf5976393bad9.png"
+IMG_TERMS = "https://i.ibb.co/Q3R5YqjS/file-00000000910c8211957902711cb364f9.png"
 
 
 # ════════════════════════════ HELPERS ════════════════════════════
@@ -77,7 +84,6 @@ def fmt_dt(d: Optional[datetime]) -> str:
 
 
 def fmt_bytes(bytes_num: int) -> str:
-    """Helper to convert bytes into human-readable data format (KB, MB, GB)."""
     val = float(bytes_num)
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if val < 1024.0:
@@ -127,55 +133,58 @@ def dec(s: str) -> str:
 
 def parse_gv_lines(text: str) -> list[dict[str, str]]:
     """
-    Parses pasted accounts line by line or raw block using pipes |, commas,
-    spaces, or newline-separated values in order:
-    1. Email
-    2. Password
-    3. Recovery Email
-    4. Phone Number (Mandatory)
+    Parses accounts into 5 items: email, password, recovery email, 2fa, phone number.
+    Supports pipe/comma-delimited formats or block newline formatting.
     """
     accounts = []
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    # Case 1: Multi-line block input (4 lines per account)
-    if len(lines) >= 4 and all(not re.search(r"[|,\t]", line) for line in lines):
-        for i in range(0, len(lines) - len(lines) % 4, 4):
-            email = lines[i].strip()
-            password = lines[i + 1].strip()
-            rec_email = lines[i + 2].strip()
-            number = lines[i + 3].strip()
-
-            # Enforce mandatory fields: Email and Phone Number must be non-empty
-            if email and number:
-                accounts.append({
-                    "email": email,
-                    "password": password,
-                    "rec_email": rec_email,
-                    "number": number,
-                })
+    # If pasting in block sequences of 5 parameters per account
+    if len(lines) >= 5 and all(not re.search(r"[|,\t]", line) for line in lines):
+        for i in range(0, len(lines) - len(lines) % 5, 5):
+            accounts.append({
+                "email": lines[i].strip(),
+                "password": lines[i + 1].strip(),
+                "rec_email": lines[i + 2].strip(),
+                "two_fa": lines[i + 3].strip(),
+                "number": lines[i + 4].strip(),
+            })
         return accounts
 
-    # Case 2: Delimited line input (| , tab or spaces)
+    # Single-line delimited input parser
     for line in lines:
         parts = [p.strip() for p in re.split(r"[|,\t]+", line) if p.strip()]
         if len(parts) == 1:
             parts = [p.strip() for p in line.split() if p.strip()]
 
-        if len(parts) >= 4:
-            email, password, rec_email, number = parts[0], parts[1], parts[2], parts[3]
-            if email and number:
-                accounts.append({
-                    "email": email,
-                    "password": password,
-                    "rec_email": rec_email,
-                    "number": number,
-                })
-
+        if len(parts) >= 5:
+            accounts.append({
+                "email": parts[0],
+                "password": parts[1],
+                "rec_email": parts[2],
+                "two_fa": parts[3],
+                "number": parts[4],
+            })
+        elif len(parts) >= 4:
+            accounts.append({
+                "email": parts[0],
+                "password": parts[1],
+                "rec_email": parts[2],
+                "two_fa": "N/A",
+                "number": parts[3],
+            })
+        elif len(parts) >= 1:
+            accounts.append({
+                "email": parts[0],
+                "password": parts[1] if len(parts) > 1 else "",
+                "rec_email": parts[2] if len(parts) > 2 else "",
+                "two_fa": parts[3] if len(parts) > 3 else "N/A",
+                "number": parts[4] if len(parts) > 4 else "",
+            })
     return accounts
 
 
 async def fetch_crypto_price(coin_id: str) -> Optional[float]:
-    """Fetch live crypto rate in USD from CoinGecko API."""
     try:
         async with aiohttp.ClientSession() as session:
             params = {"ids": coin_id, "vs_currencies": "usd"}
@@ -242,26 +251,32 @@ def main_menu(admin: bool) -> InlineKeyboardMarkup:
     return kb(rows)
 
 
-async def show(ev, text: Optional[str] = None, markup=None, content: Optional[Text] = None, plain: bool = False, entities: list = None):
-    kwargs: dict = content.as_kwargs() if content is not None else {"text": text}
-    if plain and content is None:
-        kwargs["parse_mode"] = None
-    if entities:
-        kwargs["entities"] = entities
-        kwargs.pop("parse_mode", None)
+async def show(ev, text: Optional[str] = None, markup=None, photo_url: Optional[str] = None):
+    """Renders text and edits or sends photo banners smoothly."""
+    kwargs = {"caption": text, "reply_markup": markup, "parse_mode": ParseMode.HTML}
 
     if isinstance(ev, CallbackQuery):
         try:
-            await ev.message.edit_text(**kwargs, reply_markup=markup)
+            if photo_url:
+                media = InputMediaPhoto(media=photo_url, caption=text, parse_mode=ParseMode.HTML)
+                await ev.message.edit_media(media=media, reply_markup=markup)
+            else:
+                await ev.message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
         except TelegramBadRequest as e:
             if "not modified" not in str(e):
-                await ev.message.answer(**kwargs, reply_markup=markup)
+                if photo_url:
+                    await ev.message.answer_photo(photo=photo_url, **kwargs)
+                else:
+                    await ev.message.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
         try:
             await ev.answer()
         except TelegramAPIError:
             pass
     else:
-        await ev.answer(**kwargs, reply_markup=markup)
+        if photo_url:
+            await ev.answer_photo(photo=photo_url, **kwargs)
+        else:
+            await ev.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
 
 async def alert(c: CallbackQuery, text: str):
@@ -404,19 +419,23 @@ async def purchase(user_id: int, item_id: str, user_info: str):
 
 
 def delivery_block(item: dict) -> str:
+    """Formatted delivery output block matching user image specification."""
     dt = item.get("details", {})
     if dt:
         email = dec(dt.get("email_enc", ""))
         password = dec(dt.get("pass_enc", ""))
         rec_email = dec(dt.get("rec_enc", ""))
+        two_fa = dec(dt.get("two_fa_enc", ""))
         phone_num = dec(dt.get("num_enc", ""))
 
-        return (
-            "📧 <b>Email:</b> <code>" + esc(email) + "</code>\n"
-            "🔑 <b>Password:</b> <code>" + esc(password) + "</code>\n"
-            "🔄 <b>Recovery Email:</b> <code>" + esc(rec_email) + "</code>\n"
-            "📞 <b>Phone Number:</b> <code>" + esc(phone_num) + "</code>"
-        )
+        lines = [esc(email), esc(password), esc(rec_email)]
+        if two_fa and two_fa != "N/A":
+            lines.append(esc(two_fa))
+        lines.append(esc(phone_num))
+
+        formatted_details = "\n".join(lines)
+
+        return f"🔑 <b>Account Details:</b>\n<code>{formatted_details}</code>"
 
     code = dec(item.get('code_enc', ''))
     return f"🔑 <b>Account Details:</b>\n<code>{esc(code)}</code>"
@@ -485,23 +504,26 @@ admin_router.callback_query.filter(IsAdmin())
 @user_router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
-    custom_emoji_id = config.GIFTS_EMOJI_ID
-    entities = [MessageEntity(type="custom_emoji", offset=0, length=2, custom_emoji_id=custom_emoji_id)]
-
-    welcome_text = f"🎁 Welcome to {config.STORE_NAME}\n\nSelect an option below to buy Google Voice accounts or manage your wallet balance."
-    await m.answer(welcome_text, entities=entities, reply_markup=main_menu(m.from_user.id in ADMIN_SET))
+    bal = await get_balance(m.from_user.id)
+    welcome_text = (
+        f"🎁 <b>Welcome to {config.STORE_NAME}</b>\n\n"
+        f"<b>Your Balance:</b> <b>{money(bal)}</b>\n\n"
+        "Select an option below to buy Google Voice accounts or manage your wallet balance."
+    )
+    await m.answer_photo(photo=IMG_WELCOME, caption=welcome_text, parse_mode=ParseMode.HTML, reply_markup=main_menu(m.from_user.id in ADMIN_SET))
 
 
 @user_router.callback_query(F.data == "home")
 @user_router.callback_query(F.data == "cancel")
 async def cb_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    welcome = Text(
-        CustomEmoji("🛍", custom_emoji_id=config.STORE_EMOJI_ID), " ",
-        Bold(f"Welcome to {config.STORE_NAME}"), "\n\n",
+    bal = await get_balance(c.from_user.id)
+    welcome_text = (
+        f"🎁 <b>Welcome to {config.STORE_NAME}</b>\n\n"
+        f"<b>Your Balance:</b> <b>{money(bal)}</b>\n\n"
         "Select an option below to browse products or top up your balance."
     )
-    await show(c, content=welcome, markup=main_menu(c.from_user.id in ADMIN_SET))
+    await show(c, welcome_text, main_menu(c.from_user.id in ADMIN_SET), photo_url=IMG_WELCOME)
 
 
 @user_router.callback_query(F.data == "noop")
@@ -519,8 +541,8 @@ async def cb_products_list(c: CallbackQuery):
         [btn(f"📜 Old GV — {money(OLD_GV_PRICE_CENTS)}", "gvl:old:0", "primary")],
         [back()],
     ]
-    content = Text(CustomEmoji("📦", custom_emoji_id=config.BOX_EMOJI_ID), " ", Bold("Select Google Voice Category:"))
-    await show(c, content=content, markup=kb(rows))
+    text = "📦 <b>Select Google Voice Category:</b>"
+    await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
 
 @user_router.callback_query(F.data.startswith("gvl:"))
@@ -534,7 +556,7 @@ async def cb_gv_list(c: CallbackQuery):
 
     title = "New GV" if gv_type == "new" else "Old GV"
     if not total:
-        return await show(c, f"❌ No stock available for <b>{title}</b>.", kb([[back("pl:0")]]))
+        return await show(c, f"❌ No stock available for <b>{title}</b>.", kb([[back("pl:0")]]), photo_url=IMG_BUY_GV)
 
     msg_text = f"🛍 <b>{title} Stock List</b>\n\nItems {page * 10 + 1}–{min((page + 1) * 10, total)} of <b>{total}</b>:\nSelect an item to buy."
 
@@ -544,7 +566,7 @@ async def cb_gv_list(c: CallbackQuery):
 
     rows += pager(f"gvl:{gv_type}", page, pages)
     rows.append([back("pl:0")])
-    await show(c, msg_text, kb(rows))
+    await show(c, msg_text, kb(rows), photo_url=IMG_BUY_GV)
 
 
 @user_router.callback_query(F.data.startswith("gvi:"))
@@ -573,7 +595,7 @@ async def cb_gv_item_view(c: CallbackQuery):
         rows.append([btn("➕ Top Up Balance", "w", "success")])
 
     rows.append([back(f"gvl:{item.get('gv_type', 'new')}:0")])
-    await show(c, text, kb(rows))
+    await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
 
 @user_router.callback_query(F.data.startswith("buygv:"))
@@ -584,18 +606,17 @@ async def cb_buy_gv(c: CallbackQuery):
     u_info = f"@{c.from_user.username}" if c.from_user.username else c.from_user.first_name
     order, item, err = await purchase(c.from_user.id, item_id, u_info)
     if err:
-        return await show(c, f"❌ {err}", kb([[back("pl:0")]]))
+        return await show(c, f"❌ {err}", kb([[back("pl:0")]]), photo_url=IMG_BUY_GV)
 
     text = (
-        f"✅ <b>Purchase Successful!</b>\n\n"
-        f"<b>Order ID:</b> <code>{order['order_id']}</code>\n"
-        f"<b>Amount Deducted:</b> {money(order['amount_cents'])}\n\n"
+        f"<b>Order ID: {order['order_id']}</b>\n"
+        f"<b>Amount Deducted: {money(order['amount_cents'])}</b>\n\n"
         f"<b>Delivered Account Details:</b>\n"
         f"{delivery_block(item)}"
     )
 
     rows = [[btn("📦 My Orders", "ol:0", "primary"), btn("🏠 Home", "home", "primary")]]
-    await show(c, text, kb(rows))
+    await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
 
 # ── Top-Up Wallet Workflow ──
@@ -605,14 +626,11 @@ async def cb_buy_gv(c: CallbackQuery):
 async def cb_wallet(c: CallbackQuery, state: FSMContext):
     await state.clear()
     bal = await get_balance(c.from_user.id)
-    content = Text(
-        CustomEmoji("👛", custom_emoji_id=config.WALLET_EMOJI_ID), " ", Bold("Wallet Management"),
-        "\n\nCurrent Balance: ", Bold(money(bal)),
-    )
-    await show(c, content=content, markup=kb([
+    text = f"👛 <b>Wallet Management</b>\n\n<b>Current Balance: {money(bal)}</b>"
+    await show(c, text, kb([
         [btn("➕ Top Up Balance", "tu_start", "success"), btn("📜 Transactions", "wt:0", "primary")],
         [back()],
-    ]))
+    ]), photo_url=IMG_WALLET)
 
 
 @user_router.callback_query(F.data == "tu_start")
@@ -622,7 +640,8 @@ async def cb_topup_start(c: CallbackQuery, state: FSMContext):
     await show(
         c,
         f"💵 <b>Enter Deposit Amount (in USD)</b>\n\nExample: Type <code>10</code> or <code>10.00</code>:\nMinimum Deposit: <b>${config.MIN_DEPOSIT}</b>",
-        kb([[cancel_btn("w")]])
+        kb([[cancel_btn("w")]]),
+        photo_url=IMG_WALLET
     )
 
 
@@ -686,12 +705,12 @@ async def cb_topup_currency(c: CallbackQuery, state: FSMContext):
         [btn("✅ I Have Paid", "tu_paid", "success")],
         [cancel_btn("w")]
     ]
-    await show(c, text, kb(rows))
+    await show(c, text, kb(rows), photo_url=IMG_WALLET)
 
 
 @user_router.callback_query(TopUpSt.txn_id, F.data == "tu_paid")
 async def cb_topup_paid(c: CallbackQuery):
-    await show(c, "✏️ Please type or paste your <b>Transaction Hash / TXN ID</b>:", kb([[cancel_btn("w")]]))
+    await show(c, "✏️ Please type or paste your <b>Transaction Hash / TXN ID</b>:", kb([[cancel_btn("w")]]), photo_url=IMG_WALLET)
 
 
 @user_router.message(TopUpSt.txn_id, F.text)
@@ -798,7 +817,7 @@ async def cb_transactions(c: CallbackQuery):
     else:
         lines = [f"{'+' if t['amount_cents'] >= 0 else '−'}{money(abs(t['amount_cents']))} · {esc(t['type'].title())} · {fmt_dt(t['created_at'])}" for t in docs]
         text = "📜 <b>Transaction History</b>\n\n" + "\n".join(lines)
-    await show(c, text, kb(pager("wt", page, pages) + [[back("w")]]))
+    await show(c, text, kb(pager("wt", page, pages) + [[back("w")]]), photo_url=IMG_WALLET)
 
 
 # ── Orders & Support ──
@@ -809,12 +828,12 @@ async def cb_orders(c: CallbackQuery):
     page = to_int(c.data.split(":")[1])
     docs, page, pages, total = await page_query(db.orders, {"user_id": c.from_user.id}, [("created_at", -1)], page, size=PAGE_10)
     if not total:
-        return await show(c, "📦 <b>My Orders</b>\n\nNo orders placed yet.", kb([[back()]]))
+        return await show(c, "📦 <b>My Orders</b>\n\nNo orders placed yet.", kb([[back()]]), photo_url=IMG_ORDERS)
 
     rows = [[btn(f"{o['order_id']} · {o['product_name']} · {money(o['amount_cents'])}", f"ov:{o['order_id']}", "primary")] for o in docs]
     rows += pager("ol", page, pages)
     rows.append([back()])
-    await show(c, f"📦 <b>My Orders</b> (Total: {total})", kb(rows))
+    await show(c, f"📦 <b>My Orders</b> (Total: {total})", kb(rows), photo_url=IMG_ORDERS)
 
 
 @user_router.callback_query(F.data.startswith("ov:"))
@@ -825,37 +844,33 @@ async def cb_order_view(c: CallbackQuery):
         return await alert(c, "Order record missing.")
 
     text = (
-        f"📦 <b>Order:</b> <code>{o['order_id']}</code>\n\n"
-        f"Product: <b>{esc(o['product_name'])}</b>\n"
-        f"Amount Paid: <b>{money(o['amount_cents'])}</b>\n"
-        f"Date: {fmt_dt(o['created_at'])}\n\n"
+        f"<b>Order ID: {o['order_id']}</b>\n"
+        f"<b>Amount Deducted: {money(o['amount_cents'])}</b>\n\n"
+        f"<b>Delivered Account Details:</b>\n"
     )
 
     item = await db.inventory.find_one({"item_id": o.get("item_id")})
     if item:
         text += delivery_block(item)
 
-    await show(c, text, kb([[back("ol:0")]]))
+    await show(c, text, kb([[back("ol:0")]]), photo_url=IMG_ORDERS)
 
 
 @user_router.callback_query(F.data == "sup")
 async def cb_support(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    content = Text(
-        CustomEmoji("🎧", custom_emoji_id=config.SUPPORT_EMOJI_ID), " ", Bold("Customer Support"),
-        "\n\nNeed assistance? Open a direct chat or send a message below.",
-    )
-    await show(c, content=content, markup=kb([
+    text = "🎧 <b>Customer Support</b>\n\nNeed assistance? Open a direct chat or send a message below."
+    await show(c, text, kb([
         [btn("💬 Contact Support", url=f"https://t.me/{config.SUPPORT_USERNAME.lstrip('@')}", style="success")],
         [btn("📨 Direct Message", "supm", "primary")],
         [back()],
-    ]))
+    ]), photo_url=IMG_SUPPORT)
 
 
 @user_router.callback_query(F.data == "supm")
 async def cb_support_msg(c: CallbackQuery, state: FSMContext):
     await state.set_state(SupportSt.msg)
-    await show(c, "📨 Type your support request below:", kb([[cancel_btn("sup")]]))
+    await show(c, "📨 Type your support request below:", kb([[cancel_btn("sup")]]), photo_url=IMG_SUPPORT)
 
 
 @user_router.message(SupportSt.msg, F.text)
@@ -869,8 +884,8 @@ async def msg_support(m: Message, state: FSMContext):
 @user_router.callback_query(F.data == "terms")
 async def cb_terms(c: CallbackQuery):
     terms = await get_setting("terms", config.TERMS_TEXT)
-    content = Text(CustomEmoji("📜", custom_emoji_id=config.TERMS_EMOJI_ID), " ", Bold("Terms & Conditions"), "\n\n", terms)
-    await show(c, content=content, markup=kb([[back()]]))
+    text = f"📜 <b>Terms & Conditions</b>\n\n{terms}"
+    await show(c, text, kb([[back()]]), photo_url=IMG_TERMS)
 
 
 # ═══════════════════════════════ ADMIN PANEL ═══════════════════════════════
@@ -971,11 +986,8 @@ async def cb_approve_deposit(c: CallbackQuery):
         "created_at": now(),
     })
 
-    content = Text(
-        CustomEmoji("💰", custom_emoji_id=config.WALLET_EMOJI_ID), " ", Bold("Deposit Approved!"),
-        f"\n\n{money(pay['amount_cents'])} added to your wallet.\nNew Balance: ", Bold(money(w["balance_cents"])),
-    )
-    await safe_send(pay["user_id"], **content.as_kwargs())
+    text = f"💰 <b>Deposit Approved!</b>\n\n<b>{money(pay['amount_cents'])}</b> added to your wallet.\nNew Balance: <b>{money(w['balance_cents'])}</b>"
+    await safe_send(pay["user_id"], text=text, parse_mode=ParseMode.HTML)
 
     await show(c, f"✅ Deposit <code>{pid}</code> approved and credited successfully!")
 
@@ -1048,7 +1060,7 @@ async def cb_view_deposit(c: CallbackQuery):
     await show(c, text, kb(rows))
 
 
-# ── Stock Management (With Mandatory Phone Number Validation) ──
+# ── Stock Management (5-Line Parsing Support) ──
 
 
 @admin_router.callback_query(F.data == "adm:add_choice")
@@ -1070,13 +1082,12 @@ async def cb_bulk_add_stock_start(c: CallbackQuery, state: FSMContext):
 
     prompt = (
         "➕ <b>Add stock</b>\n\n"
-        "<b>Paste accounts with mandatory phone number (4 entries required per item):</b>\n"
-        "1. Email\n"
-        "2. Password\n"
-        "3. Recovery Email\n"
-        "4. Phone Number (Mandatory)\n\n"
-        "<i>Delimiters (|), commas, spaces, or raw 4-line blocks are supported. "
-        "Any entry missing a phone number or email will be skipped.</i>\n\n"
+        "<b>Paste raw accounts (5-line blocks or single-line separated):</b>\n"
+        "Email\n"
+        "Password\n"
+        "Recovery Email\n"
+        "2FA Code\n"
+        "Phone Number\n\n"
         "<i>Send /cancel to abort.</i>"
     )
     await show(c, prompt, kb([[cancel_btn("adm:home")]]))
@@ -1094,12 +1105,7 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
 
     parsed_items = parse_gv_lines(m.text)
     if not parsed_items:
-        return await m.answer(
-            "❌ Invalid format or missing mandatory phone number.\n\n"
-            "Please paste accounts containing all 4 required details:\n"
-            "<code>Email</code>\n<code>Password</code>\n<code>Recovery Email</code>\n<code>Phone Number</code>",
-            reply_markup=kb([[cancel_btn("adm:home")]])
-        )
+        return await m.answer("❌ Invalid format or empty text. Please check layout.", reply_markup=kb([[cancel_btn("adm:home")]]))
 
     added = 0
     skipped = 0
@@ -1109,10 +1115,10 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
         email = item.get("email", "").strip()
         pwd = item.get("password", "").strip()
         rec = item.get("rec_email", "").strip()
+        two_fa = item.get("two_fa", "").strip()
         phone = item.get("number", "").strip()
 
-        # Enforce both email and phone number requirement
-        if not email or not phone:
+        if not email:
             invalid += 1
             continue
 
@@ -1134,9 +1140,10 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
                 "email_enc": email_enc,
                 "pass_enc": enc(pwd),
                 "rec_enc": enc(rec),
+                "two_fa_enc": enc(two_fa),
                 "num_enc": enc(phone),
             },
-            "code_enc": enc(f"{email}|{pwd}|{rec}|{phone}"),
+            "code_enc": enc(f"{email}\n{pwd}\n{rec}\n{two_fa}\n{phone}"),
             "status": "available",
             "created_at": now(),
             "added_by": m.from_user.id,
@@ -1191,7 +1198,6 @@ async def cb_active_item_view(c: CallbackQuery):
         f"Type: <b>{item.get('gv_type', 'N/A').upper()}</b>\n"
         f"Price: <b>{money(item['price_cents'])}</b>\n"
         f"Status: <b>{item['status']}</b>\n\n"
-        f"<b>Account Credentials:</b>\n"
         f"{delivery_block(item)}"
     )
 
@@ -1255,14 +1261,12 @@ async def cb_admin_stats(c: CallbackQuery):
     sold = await db.inventory.count_documents({"status": "sold"})
     pending_dep = await db.payments.count_documents({"status": "pending"})
 
-    # Fetch Network I/O Data Usage statistics
     net_io = psutil.net_io_counters()
     bytes_sent = fmt_bytes(net_io.bytes_sent)
     bytes_recv = fmt_bytes(net_io.bytes_recv)
     packets_sent = net_io.packets_sent
     packets_recv = net_io.packets_recv
 
-    # Calculate total revenue from completed orders
     pipeline = [{"$match": {"status": "completed"}}, {"$group": {"_id": None, "total": {"$sum": "$amount_cents"}}}]
     rev_res = await db.orders.aggregate(pipeline).to_list(1)
     rev_cents = rev_res[0]["total"] if rev_res else 0

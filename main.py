@@ -1,6 +1,7 @@
 """
 Digital product store bot — Aiogram 3.x + MongoDB (Motor) + Crypto API Payments.
 Includes complete inventory deletion (Single & Bulk Delete) + Data Usage Tracking.
+Updated: Parsing enforces 4 mandatory components (Email, Password, Recovery, Phone Number).
 """
 from __future__ import annotations
 
@@ -127,43 +128,49 @@ def dec(s: str) -> str:
 def parse_gv_lines(text: str) -> list[dict[str, str]]:
     """
     Parses pasted accounts line by line or raw block using pipes |, commas,
-    spaces, or newline separated values in order:
-    email | password | recovery | phone
+    spaces, or newline-separated values in order:
+    1. Email
+    2. Password
+    3. Recovery Email
+    4. Phone Number (Mandatory)
     """
     accounts = []
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
+    # Case 1: Multi-line block input (4 lines per account)
     if len(lines) >= 4 and all(not re.search(r"[|,\t]", line) for line in lines):
-        raw_tokens = lines
-        for i in range(0, len(raw_tokens) - len(raw_tokens) % 4, 4):
-            accounts.append({
-                "email": raw_tokens[i].strip(),
-                "password": raw_tokens[i + 1].strip(),
-                "rec_email": raw_tokens[i + 2].strip(),
-                "number": raw_tokens[i + 3].strip(),
-            })
+        for i in range(0, len(lines) - len(lines) % 4, 4):
+            email = lines[i].strip()
+            password = lines[i + 1].strip()
+            rec_email = lines[i + 2].strip()
+            number = lines[i + 3].strip()
+
+            # Enforce mandatory fields: Email and Phone Number must be non-empty
+            if email and number:
+                accounts.append({
+                    "email": email,
+                    "password": password,
+                    "rec_email": rec_email,
+                    "number": number,
+                })
         return accounts
 
+    # Case 2: Delimited line input (| , tab or spaces)
     for line in lines:
         parts = [p.strip() for p in re.split(r"[|,\t]+", line) if p.strip()]
         if len(parts) == 1:
             parts = [p.strip() for p in line.split() if p.strip()]
 
         if len(parts) >= 4:
-            accounts.append({
-                "email": parts[0],
-                "password": parts[1],
-                "rec_email": parts[2],
-                "number": parts[3],
-            })
-        elif len(parts) >= 1:
-            accounts.append({
-                "raw": line,
-                "email": parts[0],
-                "password": parts[1] if len(parts) > 1 else "",
-                "rec_email": parts[2] if len(parts) > 2 else "",
-                "number": parts[3] if len(parts) > 3 else "",
-            })
+            email, password, rec_email, number = parts[0], parts[1], parts[2], parts[3]
+            if email and number:
+                accounts.append({
+                    "email": email,
+                    "password": password,
+                    "rec_email": rec_email,
+                    "number": number,
+                })
+
     return accounts
 
 
@@ -777,7 +784,7 @@ async def msg_topup_proof(m: Message, state: FSMContext):
 @user_router.message(TopUpSt.proof_photo)
 async def msg_topup_proof_invalid(m: Message):
     await m.answer(
-        "⚠️️ Please upload a valid image screenshot of your payment proof.",
+        "⚠ Please upload a valid image screenshot of your payment proof.",
         reply_markup=kb([[cancel_btn("w")]])
     )
 
@@ -873,7 +880,7 @@ def admin_menu() -> InlineKeyboardMarkup:
     return kb([
         [btn("➕ Add Stock", "adm:add_choice", "success"), btn("📦 Active Stock", "adm:ai:0", "primary")],
         [btn("🔥 Delete All Stock", "adm:del_all_confirm", "danger"), btn("🛒 Sold Stock", "adm:ss:0", "primary")],
-        [btn("💳 Pending Deposits", "adm:pd:0", "primary"), btn("⚙️️ Manage Wallets", "adm:wallets", "primary")],
+        [btn("💳 Pending Deposits", "adm:pd:0", "primary"), btn("⚙ Manage Wallets", "adm:wallets", "primary")],
         [btn("📊 Statistics & Data Usage", "adm:st", "primary")],
         [btn("📝 Terms", "adm:tm", "primary")],
         [back("home")],
@@ -883,7 +890,7 @@ def admin_menu() -> InlineKeyboardMarkup:
 @admin_router.message(Command("admin"))
 async def cmd_admin(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("⚙️️ <b>Admin Control Panel</b>", reply_markup=admin_menu())
+    await m.answer("⚙ <b>Admin Control Panel</b>", reply_markup=admin_menu())
 
 
 @admin_router.callback_query(F.data.in_({"adm:home", "adm:cancel"}))
@@ -899,7 +906,7 @@ async def cb_admin_home(c: CallbackQuery, state: FSMContext):
 async def cb_admin_wallets(c: CallbackQuery, state: FSMContext):
     await state.clear()
     wallets = await get_active_wallets()
-    lines = ["⚙️️ <b>Wallet Addresses Management</b>\n"]
+    lines = ["⚙ <b>Wallet Addresses Management</b>\n"]
     rows = []
 
     for key, addr in wallets.items():
@@ -1041,7 +1048,7 @@ async def cb_view_deposit(c: CallbackQuery):
     await show(c, text, kb(rows))
 
 
-# ── Stock Management (With Delete Single and Delete All) ──
+# ── Stock Management (With Mandatory Phone Number Validation) ──
 
 
 @admin_router.callback_query(F.data == "adm:add_choice")
@@ -1063,10 +1070,13 @@ async def cb_bulk_add_stock_start(c: CallbackQuery, state: FSMContext):
 
     prompt = (
         "➕ <b>Add stock</b>\n\n"
-        "<b>Paste accounts, one per line:</b>\n"
-        "email | password | recovery mail | phone number\n\n"
-        "Commas, plain spaces or one-field-per-line all work too – just keep that order "
-        "(email, password, recovery, phone). Duplicates are skipped; new stock goes live instantly.\n\n"
+        "<b>Paste accounts with mandatory phone number (4 entries required per item):</b>\n"
+        "1. Email\n"
+        "2. Password\n"
+        "3. Recovery Email\n"
+        "4. Phone Number (Mandatory)\n\n"
+        "<i>Delimiters (|), commas, spaces, or raw 4-line blocks are supported. "
+        "Any entry missing a phone number or email will be skipped.</i>\n\n"
         "<i>Send /cancel to abort.</i>"
     )
     await show(c, prompt, kb([[cancel_btn("adm:home")]]))
@@ -1084,7 +1094,12 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
 
     parsed_items = parse_gv_lines(m.text)
     if not parsed_items:
-        return await m.answer("❌ Invalid format or empty text. Please paste accounts in order.", reply_markup=kb([[cancel_btn("adm:home")]]))
+        return await m.answer(
+            "❌ Invalid format or missing mandatory phone number.\n\n"
+            "Please paste accounts containing all 4 required details:\n"
+            "<code>Email</code>\n<code>Password</code>\n<code>Recovery Email</code>\n<code>Phone Number</code>",
+            reply_markup=kb([[cancel_btn("adm:home")]])
+        )
 
     added = 0
     skipped = 0
@@ -1096,7 +1111,8 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
         rec = item.get("rec_email", "").strip()
         phone = item.get("number", "").strip()
 
-        if not email:
+        # Enforce both email and phone number requirement
+        if not email or not phone:
             invalid += 1
             continue
 

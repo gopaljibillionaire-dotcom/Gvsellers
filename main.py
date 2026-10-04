@@ -1,6 +1,6 @@
 """
 Digital product store bot — Aiogram 3.x + MongoDB (Motor) + Crypto API Payments.
-Includes complete inventory deletion (Single & Bulk Delete) + Data Usage Tracking + Dynamic Banner Images.
+Includes complete inventory deletion (Single & Bulk Delete) + Data Usage Tracking + Dynamic Banner Images + Quantity Selection.
 """
 from __future__ import annotations
 
@@ -132,24 +132,17 @@ def dec(s: str) -> str:
 
 
 def parse_gv_lines(text: str) -> list[dict[str, str]]:
-    """
-    Parses accounts. Stores raw text as-is so it can be delivered exactly
-    as received without restructuring. Also supports bulk blocks separated
-    by double line breaks or pipe/comma-delimited items.
-    """
     accounts = []
     text_clean = text.strip()
     if not text_clean:
         return accounts
 
-    # If input contains multi-item blocks separated by double line breaks (empty lines)
     if "\n\n" in text_clean:
         blocks = [b.strip() for b in text_clean.split("\n\n") if b.strip()]
         for block in blocks:
             accounts.append({"raw_text": block})
         return accounts
 
-    # Handle pipe/comma/tab single line formats
     lines = [line.strip() for line in text_clean.splitlines() if line.strip()]
     if any(re.search(r"[|,\t]", line) for line in lines):
         for line in lines:
@@ -158,7 +151,6 @@ def parse_gv_lines(text: str) -> list[dict[str, str]]:
                 accounts.append({"raw_text": "\n".join(parts)})
         return accounts
 
-    # Treat the entire message block as a single exact as-is account item
     accounts.append({"raw_text": text_clean})
     return accounts
 
@@ -199,7 +191,7 @@ def kb(rows: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def back(cb: str = "home", text: str = "⬅️ Back"):
+def back(cb: str = "home", text: str = "⬅️ Back to Menu"):
     return btn(text, cb, "danger")
 
 
@@ -231,7 +223,7 @@ def main_menu(admin: bool) -> InlineKeyboardMarkup:
 
 
 async def show(ev, text: Optional[str] = None, markup=None, photo_url: Optional[str] = None):
-    """Renders text and edits or sends photo banners smoothly."""
+    """Renders text and edits or sends photo banners smoothly in the exact same message."""
     kwargs = {"caption": text, "reply_markup": markup, "parse_mode": ParseMode.HTML}
 
     if isinstance(ev, CallbackQuery):
@@ -331,42 +323,46 @@ async def get_balance(user_id: int) -> int:
 # ═══════════════════════════ INVENTORY & PURCHASES ═══════════════════════════
 
 
-async def purchase(user_id: int, item_id: str, user_info: str):
-    item = await db.inventory.find_one({"item_id": item_id, "status": "available"})
-    if not item:
-        return None, None, "This item is no longer available."
-
-    cents = item["price_cents"]
-    gv_title = "New GV" if item.get("gv_type") == "new" else "Old GV"
-    oid = new_id("ORD", 5)
+async def bulk_purchase(user_id: int, gv_type: str, qty: int, user_info: str):
+    unit_price = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
+    total_cents = unit_price * qty
+    gv_title = "New GV" if gv_type == "new" else "Old GV"
     t = now()
 
-    reserved = await db.inventory.find_one_and_update(
-        {"item_id": item_id, "status": "available"},
-        {"$set": {"status": "reserved", "order_id": oid, "buyer_id": user_id, "reserved_at": t}},
-        return_document=ReturnDocument.AFTER,
-    )
-    if not reserved:
-        return None, None, "Item was snatched by another buyer."
+    # Step 1: Check available items
+    available_items = await db.inventory.find(
+        {"gv_type": gv_type, "status": "available"}
+    ).limit(qty).to_list(qty)
 
+    if len(available_items) < qty:
+        return None, None, f"Insufficient stock available. Only {len(available_items)} available."
+
+    item_ids = [item["item_id"] for item in available_items]
+
+    # Step 2: Check and deduct wallet balance
     w = await db.wallets.find_one_and_update(
-        {"user_id": user_id, "balance_cents": {"$gte": cents}},
-        {"$inc": {"balance_cents": -cents}, "$set": {"updated_at": now()}},
+        {"user_id": user_id, "balance_cents": {"$gte": total_cents}},
+        {"$inc": {"balance_cents": -total_cents}, "$set": {"updated_at": t}},
         return_document=ReturnDocument.AFTER,
     )
     if not w:
-        await db.inventory.update_one({"item_id": item_id}, {"$set": {"status": "available"}, "$unset": {"order_id": "", "buyer_id": ""}})
-        return None, None, f"Insufficient balance. You need {money(cents)}."
+        return None, None, f"Insufficient balance. You need {money(total_cents)}."
 
-    await db.inventory.update_one({"item_id": item_id}, {"$set": {"status": "sold", "sold_at": t}})
+    # Step 3: Reserve and update stock status to sold
+    oid = new_id("ORD", 5)
+    await db.inventory.update_many(
+        {"item_id": {"$in": item_ids}},
+        {"$set": {"status": "sold", "order_id": oid, "buyer_id": user_id, "sold_at": t}}
+    )
 
     order = {
         "order_id": oid,
         "user_id": user_id,
-        "product_name": gv_title,
-        "amount_cents": cents,
+        "product_name": f"{gv_title} x{qty}",
+        "amount_cents": total_cents,
+        "quantity": qty,
+        "item_ids": item_ids,
         "status": "completed",
-        "item_id": item_id,
         "created_at": t,
     }
     await db.orders.insert_one(order)
@@ -375,9 +371,9 @@ async def purchase(user_id: int, item_id: str, user_info: str):
         "tx_id": new_id("TX", 6),
         "user_id": user_id,
         "type": "purchase",
-        "amount_cents": -cents,
+        "amount_cents": -total_cents,
         "ref_id": oid,
-        "note": f"Purchased {gv_title}",
+        "note": f"Purchased {qty}x {gv_title}",
         "applied": True,
         "balance_after_cents": w["balance_cents"],
         "created_at": t,
@@ -387,17 +383,16 @@ async def purchase(user_id: int, item_id: str, user_info: str):
         CustomEmoji("🛍", custom_emoji_id=config.STORE_EMOJI_ID), " ", Bold("New Product Purchase!"), "\n\n",
         f"<b>Order ID:</b> <code>{oid}</code>\n",
         f"<b>Buyer:</b> {user_info} (ID: <code>{user_id}</code>)\n",
-        f"<b>Product:</b> {gv_title}\n",
-        f"<b>Price Paid:</b> {money(cents)}\n",
+        f"<b>Product:</b> {gv_title} x{qty}\n",
+        f"<b>Price Paid:</b> {money(total_cents)}\n",
         f"<b>Remaining User Balance:</b> {money(w['balance_cents'])}"
     )
     await notify_admins(content=admin_alert)
 
-    return order, reserved, None
+    return order, available_items, None
 
 
 def delivery_block(item: dict) -> str:
-    """Delivers account data exactly as added without modification."""
     raw_enc = item.get("raw_text_enc")
     if raw_enc:
         content = dec(raw_enc)
@@ -417,7 +412,7 @@ def delivery_block(item: dict) -> str:
         else:
             content = dec(item.get("code_enc", ""))
 
-    return f"🔑 <b>Account Details:</b>\n<code>{esc(content)}</code>"
+    return f"<code>{esc(content)}</code>"
 
 
 # ═══════════════════════ MIDDLEWARES & STATES ═══════════════════════
@@ -452,6 +447,10 @@ class TopUpSt(StatesGroup):
     currency = State()
     txn_id = State()
     proof_photo = State()
+
+
+class BuyGVSt(StatesGroup):
+    custom_qty = State()
 
 
 class AdminWalletSt(StatesGroup):
@@ -510,91 +509,142 @@ async def cb_noop(c: CallbackQuery):
     await c.answer()
 
 
-# ── Products Catalog ──
+# ── Products Catalog & Quantity Selection ──
 
 
 @user_router.callback_query(F.data.startswith("pl:"))
-async def cb_products_list(c: CallbackQuery):
+async def cb_products_list(c: CallbackQuery, state: FSMContext):
+    await state.clear()
     rows = [
-        [btn(f"🟢 New GV — {money(NEW_GV_PRICE_CENTS)}", "gvl:new:0", "success")],
-        [btn(f"📜 Old GV — {money(OLD_GV_PRICE_CENTS)}", "gvl:old:0", "primary")],
+        [btn(f"🟢 New GV — {money(NEW_GV_PRICE_CENTS)}", "gv_select:new", "success")],
+        [btn(f"📜 Old GV — {money(OLD_GV_PRICE_CENTS)}", "gv_select:old", "primary")],
         [back()],
     ]
     text = "📦 <b>Select Google Voice Category:</b>"
     await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
 
-@user_router.callback_query(F.data.startswith("gvl:"))
-async def cb_gv_list(c: CallbackQuery):
-    _, gv_type, page_str = c.data.split(":")
-    page = to_int(page_str)
+@user_router.callback_query(F.data.startswith("gv_select:"))
+async def cb_gv_select(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    gv_type = c.data.split(":")[1]
+    unit_cents = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
+    gv_title = "New GV" if gv_type == "new" else "Old GV"
 
-    docs, page, pages, total = await page_query(
-        db.inventory, {"gv_type": gv_type, "status": "available"}, [("created_at", -1)], page, size=PAGE_10
-    )
-
-    title = "New GV" if gv_type == "new" else "Old GV"
-    if not total:
-        return await show(c, f"❌ No stock available for <b>{title}</b>.", kb([[back("pl:0")]]), photo_url=IMG_BUY_GV)
-
-    msg_text = f"🛍 <b>{title} Stock List</b>\n\nItems {page * 10 + 1}–{min((page + 1) * 10, total)} of <b>{total}</b>:\nSelect an item to buy."
-
-    rows = []
-    for idx, item in enumerate(docs, start=1 + (page * 10)):
-        rows.append([btn(f"{title} #{idx} — {money(item['price_cents'])}", f"gvi:{item['item_id']}", "success")])
-
-    rows += pager(f"gvl:{gv_type}", page, pages)
-    rows.append([back("pl:0")])
-    await show(c, msg_text, kb(rows), photo_url=IMG_BUY_GV)
-
-
-@user_router.callback_query(F.data.startswith("gvi:"))
-async def cb_gv_item_view(c: CallbackQuery):
-    item_id = c.data.split(":")[1]
-    item = await db.inventory.find_one({"item_id": item_id, "status": "available"})
-    if not item:
-        return await alert(c, "Item is no longer available.")
-
+    available_count = await db.inventory.count_documents({"gv_type": gv_type, "status": "available"})
     bal = await get_balance(c.from_user.id)
-    cents = item["price_cents"]
-    gv_title = "New GV" if item.get("gv_type") == "new" else "Old GV"
 
     text = (
-        f"🛍 <b>Item Selection: {gv_title}</b>\n\n"
-        f"Price: <b>{money(cents)}</b>\n"
+        f"📦 <b>Category: {gv_title}</b>\n\n"
+        f"Price per account: <b>{money(unit_cents)}</b>\n"
+        f"Available Stock: <b>{available_count}</b> accounts\n"
         f"Your Balance: <b>{money(bal)}</b>\n\n"
-        "<i>Account credentials will be revealed upon checkout.</i>"
+        "Select quantity using the buttons below or click <b>Custom Quantity</b> to type an amount:"
     )
 
-    rows = []
-    if bal >= cents:
-        rows.append([btn(f"💳 Purchase for {money(cents)}", f"buygv:{item_id}", "success")])
-    else:
-        text += f"\n\n⚠️ You need <b>{money(cents - bal)}</b> more in your balance."
-        rows.append([btn("➕ Top Up Balance", "w", "success")])
-
-    rows.append([back(f"gvl:{item.get('gv_type', 'new')}:0")])
+    rows = [
+        [btn("1", f"gv_confirm:{gv_type}:1"), btn("2", f"gv_confirm:{gv_type}:2"), btn("5", f"gv_confirm:{gv_type}:5")],
+        [btn("10", f"gv_confirm:{gv_type}:10"), btn("15", f"gv_confirm:{gv_type}:15")],
+        [btn("✏️ Custom Quantity", f"gv_custom:{gv_type}", "primary")],
+        [back("pl:0")]
+    ]
     await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
 
-@user_router.callback_query(F.data.startswith("buygv:"))
-async def cb_buy_gv(c: CallbackQuery):
-    item_id = c.data.split(":")[1]
-    await c.answer("Processing order...")
+@user_router.callback_query(F.data.startswith("gv_custom:"))
+async def cb_gv_custom_prompt(c: CallbackQuery, state: FSMContext):
+    gv_type = c.data.split(":")[1]
+    await state.update_data(gv_type=gv_type)
+    await state.set_state(BuyGVSt.custom_qty)
+
+    gv_title = "New GV" if gv_type == "new" else "Old GV"
+    await show(
+        c,
+        f"✏️ <b>Enter Custom Quantity for {gv_title}:</b>\n\nPlease type the number of accounts you wish to purchase (e.g. <code>3</code> or <code>20</code>):",
+        kb([[cancel_btn(f"gv_select:{gv_type}")]]),
+        photo_url=IMG_BUY_GV
+    )
+
+
+@user_router.message(BuyGVSt.custom_qty, F.text)
+async def msg_gv_custom_qty(m: Message, state: FSMContext):
+    qty = to_int(m.text.strip())
+    if qty <= 0:
+        return await m.answer("❌ Please enter a valid positive whole number.", reply_markup=kb([[cancel_btn("pl:0")]]))
+
+    data = await state.get_data()
+    gv_type = data.get("gv_type", "new")
+    await state.clear()
+
+    await render_gv_checkout(m, m.from_user.id, gv_type, qty)
+
+
+@user_router.callback_query(F.data.startswith("gv_confirm:"))
+async def cb_gv_confirm_qty(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    _, gv_type, qty_str = c.data.split(":")
+    qty = to_int(qty_str)
+    await render_gv_checkout(c, c.from_user.id, gv_type, qty)
+
+
+async def render_gv_checkout(ev, user_id: int, gv_type: str, qty: int):
+    unit_cents = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
+    total_cents = unit_cents * qty
+    gv_title = "New GV" if gv_type == "new" else "Old GV"
+    bal = await get_balance(user_id)
+
+    available_count = await db.inventory.count_documents({"gv_type": gv_type, "status": "available"})
+
+    text = (
+        f"🛍 <b>Order Summary: {gv_title}</b>\n\n"
+        f"Quantity: <b>{qty}</b>\n"
+        f"Unit Price: <b>{money(unit_cents)}</b>\n"
+        f"Total Price: <b>{money(total_cents)}</b>\n\n"
+        f"Your Current Balance: <b>{money(bal)}</b>\n"
+        f"Available Stock: <b>{available_count}</b>\n\n"
+    )
+
+    rows = []
+    if available_count < qty:
+        text += f"❌ <b>Not enough stock available!</b> Maximum available is {available_count}."
+        rows.append([back(f"gv_select:{gv_type}", "⬅️ Change Quantity")])
+    elif bal < total_cents:
+        shortfall = total_cents - bal
+        text += f"⚠️ <b>Insufficient Balance!</b> You need <b>{money(shortfall)}</b> more."
+        rows.append([btn("➕ Top Up Balance", "w", "success")])
+        rows.append([back(f"gv_select:{gv_type}", "⬅️ Change Quantity")])
+    else:
+        text += "<i>Click below to confirm payment and receive your account credentials instantly.</i>"
+        rows.append([btn(f"💳 Pay {money(total_cents)}", f"buygv_exec:{gv_type}:{qty}", "success")])
+        rows.append([back(f"gv_select:{gv_type}", "⬅️ Change Quantity")])
+
+    await show(ev, text, kb(rows), photo_url=IMG_BUY_GV)
+
+
+@user_router.callback_query(F.data.startswith("buygv_exec:"))
+async def cb_buy_gv_exec(c: CallbackQuery):
+    _, gv_type, qty_str = c.data.split(":")
+    qty = to_int(qty_str)
+    await c.answer("Processing your order...")
 
     u_info = f"@{c.from_user.username}" if c.from_user.username else c.from_user.first_name
-    order, item, err = await purchase(c.from_user.id, item_id, u_info)
+    order, items, err = await bulk_purchase(c.from_user.id, gv_type, qty, u_info)
+
     if err:
         return await show(c, f"❌ {err}", kb([[back("pl:0")]]), photo_url=IMG_BUY_GV)
 
+    accounts_str = "\n\n".join([f"<b>Account #{idx}:</b>\n{delivery_block(item)}" for idx, item in enumerate(items, 1)])
+
     text = (
-        f"<b>Order ID: {order['order_id']}</b>\n"
-        f"<b>Amount Deducted: {money(order['amount_cents'])}</b>\n\n"
-        f"<b>Delivered Account Details:</b>\n"
-        f"{delivery_block(item)}"
+        f"✅ <b>Order Placed Successfully!</b>\n\n"
+        f"<b>Order ID:</b> <code>{order['order_id']}</code>\n"
+        f"<b>Product:</b> {order['product_name']}\n"
+        f"<b>Total Paid:</b> {money(order['amount_cents'])}\n\n"
+        f"🔑 <b>Delivered Account Details:</b>\n\n"
+        f"{accounts_str}"
     )
 
-    rows = [[btn("📦 My Orders", "ol:0", "primary"), btn("🏠 Home", "home", "primary")]]
+    rows = [[btn("📦 My Orders", "ol:0", "primary"), back("home", "🏠 Back to Menu")]]
     await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
 
@@ -824,13 +874,19 @@ async def cb_order_view(c: CallbackQuery):
 
     text = (
         f"<b>Order ID: {o['order_id']}</b>\n"
+        f"<b>Product: {o['product_name']}</b>\n"
         f"<b>Amount Deducted: {money(o['amount_cents'])}</b>\n\n"
-        f"<b>Delivered Account Details:</b>\n"
+        f"<b>Delivered Account Details:</b>\n\n"
     )
 
-    item = await db.inventory.find_one({"item_id": o.get("item_id")})
-    if item:
-        text += delivery_block(item)
+    if o.get("item_ids"):
+        items = await db.inventory.find({"item_id": {"$in": o["item_ids"]}}).to_list(len(o["item_ids"]))
+        for idx, item in enumerate(items, 1):
+            text += f"<b>Account #{idx}:</b>\n{delivery_block(item)}\n\n"
+    elif o.get("item_id"):
+        item = await db.inventory.find_one({"item_id": o["item_id"]})
+        if item:
+            text += delivery_block(item)
 
     await show(c, text, kb([[back("ol:0")]]), photo_url=IMG_ORDERS)
 
@@ -877,7 +933,7 @@ def admin_menu() -> InlineKeyboardMarkup:
         [btn("💳 Pending Deposits", "adm:pd:0", "primary"), btn("⚙ Manage Wallets", "adm:wallets", "primary")],
         [btn("📊 Statistics & Data Usage", "adm:st", "primary")],
         [btn("📝 Terms", "adm:tm", "primary")],
-        [back("home")],
+        [back("home", "🏠 User Menu")],
     ])
 
 
@@ -968,7 +1024,7 @@ async def cb_approve_deposit(c: CallbackQuery):
     text = f"💰 <b>Deposit Approved!</b>\n\n<b>{money(pay['amount_cents'])}</b> added to your wallet.\nNew Balance: <b>{money(w['balance_cents'])}</b>"
     await safe_send(pay["user_id"], text=text, parse_mode=ParseMode.HTML)
 
-    await show(c, f"✅ Deposit <code>{pid}</code> approved and credited successfully!")
+    await show(c, f"✅ Deposit <code>{pid}</code> approved and credited successfully!", kb([[back("adm:home")]]))
 
 
 @admin_router.callback_query(F.data.startswith("adm:rej_dep:"))
@@ -983,7 +1039,7 @@ async def cb_reject_deposit(c: CallbackQuery):
         return await alert(c, "Deposit already processed.")
 
     await safe_send(pay["user_id"], text=f"❌ Deposit <code>{pid}</code> was rejected by admin.")
-    await show(c, f"❌ Deposit <code>{pid}</code> rejected.")
+    await show(c, f"❌ Deposit <code>{pid}</code> rejected.", kb([[back("adm:home")]]))
 
 
 @admin_router.callback_query(F.data.startswith("adm:pd:"))
@@ -1025,21 +1081,10 @@ async def cb_view_deposit(c: CallbackQuery):
         rows.append([btn("✅ Approve", f"adm:app_dep:{pid}", "success"), btn("❌ Reject", f"adm:rej_dep:{pid}", "danger")])
     rows.append([back("adm:pd:0")])
 
-    if p.get("photo_id"):
-        try:
-            await bot_ref.send_photo(c.from_user.id, photo=p["photo_id"], caption=text, reply_markup=kb(rows), parse_mode=ParseMode.HTML)
-            return
-        except TelegramAPIError:
-            try:
-                await bot_ref.send_document(c.from_user.id, document=p["photo_id"], caption=text, reply_markup=kb(rows), parse_mode=ParseMode.HTML)
-                return
-            except TelegramAPIError:
-                pass
-
     await show(c, text, kb(rows))
 
 
-# ── Stock Management (As-Is Raw Block Delivery Support) ──
+# ── Stock Management ──
 
 
 @admin_router.callback_query(F.data == "adm:add_choice")
@@ -1129,7 +1174,7 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
 
     reply_markup = kb([
         [btn("➕ Add stock", "adm:add_choice", "success")],
-        [back("adm:home", "🏠 User menu")]
+        [back("adm:home", "🏠 Admin Menu")]
     ])
 
     await m.answer(report_text, reply_markup=reply_markup)
@@ -1162,6 +1207,7 @@ async def cb_active_item_view(c: CallbackQuery):
         f"Type: <b>{item.get('gv_type', 'N/A').upper()}</b>\n"
         f"Price: <b>{money(item['price_cents'])}</b>\n"
         f"Status: <b>{item['status']}</b>\n\n"
+        f"🔑 <b>Credentials:</b>\n"
         f"{delivery_block(item)}"
     )
 

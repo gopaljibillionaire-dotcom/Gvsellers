@@ -54,8 +54,8 @@ OLD_GV_PRICE_CENTS = 600  # $6.00
 # Image Banners
 IMG_WELCOME = "https://i.ibb.co/3mMm5pk8/file-00000000304481fabc208d5a014f5b11.png"
 IMG_BUY_GV = "https://i.ibb.co/qFBDtRMT/file-00000000543c821195d09ed80ad42f1c.png"
-IMG_WALLET = "https://i.ibb.co/xKhG0g3D/file-00000000b8b48211b02df47384536e56.png"
-IMG_ORDERS = "https://i.ibb.co/Z6NpMbWG/file-0000000056e081fa90ef2c05289f9691.png"
+IMG_ORDERS = "https://i.ibb.co/xKhG0g3D/file-00000000b8b48211b02df47384536e56.png"
+IMG_WALLET = "https://i.ibb.co/Z6NpMbWG/file-0000000056e081fa90ef2c05289f9691.png"
 IMG_SUPPORT = "https://i.ibb.co/Bxy6JP8/file-0000000024bc8210a4acf5976393bad9.png"
 IMG_TERMS = "https://i.ibb.co/Q3R5YqjS/file-00000000910c8211957902711cb364f9.png"
 

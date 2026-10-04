@@ -1,5 +1,6 @@
 """
 Digital product store bot — Aiogram 3.x + MongoDB (Motor) + Crypto API Payments.
+Includes complete inventory deletion (Single & Bulk Delete) + Data Usage Tracking.
 """
 from __future__ import annotations
 
@@ -8,12 +9,14 @@ import base64
 import hashlib
 import html
 import logging
+import re
 import secrets
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Optional
 
 import aiohttp
+import psutil  # Data usage tracking
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -72,6 +75,16 @@ def fmt_dt(d: Optional[datetime]) -> str:
     return d.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if d else "—"
 
 
+def fmt_bytes(bytes_num: int) -> str:
+    """Helper to convert bytes into human-readable data format (KB, MB, GB)."""
+    val = float(bytes_num)
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if val < 1024.0:
+            return f"{val:.2f} {unit}"
+        val /= 1024.0
+    return f"{val:.2f} PB"
+
+
 def parse_money(text: str) -> Optional[int]:
     try:
         d = Decimal(text.strip().replace("$", "").replace(",", ""))
@@ -109,6 +122,49 @@ def dec(s: str) -> str:
         return _fernet.decrypt(s.encode()).decode()
     except (InvalidToken, ValueError):
         return ""
+
+
+def parse_gv_lines(text: str) -> list[dict[str, str]]:
+    """
+    Parses pasted accounts line by line or raw block using pipes |, commas,
+    spaces, or newline separated values in order:
+    email | password | recovery | phone
+    """
+    accounts = []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    if len(lines) >= 4 and all(not re.search(r"[|,\t]", line) for line in lines):
+        raw_tokens = lines
+        for i in range(0, len(raw_tokens) - len(raw_tokens) % 4, 4):
+            accounts.append({
+                "email": raw_tokens[i].strip(),
+                "password": raw_tokens[i + 1].strip(),
+                "rec_email": raw_tokens[i + 2].strip(),
+                "number": raw_tokens[i + 3].strip(),
+            })
+        return accounts
+
+    for line in lines:
+        parts = [p.strip() for p in re.split(r"[|,\t]+", line) if p.strip()]
+        if len(parts) == 1:
+            parts = [p.strip() for p in line.split() if p.strip()]
+
+        if len(parts) >= 4:
+            accounts.append({
+                "email": parts[0],
+                "password": parts[1],
+                "rec_email": parts[2],
+                "number": parts[3],
+            })
+        elif len(parts) >= 1:
+            accounts.append({
+                "raw": line,
+                "email": parts[0],
+                "password": parts[1] if len(parts) > 1 else "",
+                "rec_email": parts[2] if len(parts) > 2 else "",
+                "number": parts[3] if len(parts) > 3 else "",
+            })
+    return accounts
 
 
 async def fetch_crypto_price(coin_id: str) -> Optional[float]:
@@ -243,10 +299,11 @@ async def init_db():
     await db.users.create_index("user_id", unique=True)
     await db.inventory.create_index("item_id", unique=True)
     await db.inventory.create_index([("status", A), ("gv_type", A)])
+    await db.inventory.create_index("details.email_enc")
     await db.orders.create_index("order_id", unique=True)
     await db.orders.create_index([("user_id", A), ("created_at", D)])
     await db.payments.create_index("payment_id", unique=True)
-    
+
     try:
         await db.payments.drop_index("merchant_trade_no_1")
     except Exception:
@@ -346,14 +403,14 @@ def delivery_block(item: dict) -> str:
         password = dec(dt.get("pass_enc", ""))
         rec_email = dec(dt.get("rec_enc", ""))
         phone_num = dec(dt.get("num_enc", ""))
-        
+
         return (
             "📧 <b>Email:</b> <code>" + esc(email) + "</code>\n"
             "🔑 <b>Password:</b> <code>" + esc(password) + "</code>\n"
             "🔄 <b>Recovery Email:</b> <code>" + esc(rec_email) + "</code>\n"
             "📞 <b>Phone Number:</b> <code>" + esc(phone_num) + "</code>"
         )
-    
+
     code = dec(item.get('code_enc', ''))
     return f"🔑 <b>Account Details:</b>\n<code>{esc(code)}</code>"
 
@@ -397,15 +454,9 @@ class AdminWalletSt(StatesGroup):
     address = State()
 
 
-class AddStockFreshGV(StatesGroup):
-    email = State()
-    password = State()
-    rec_email = State()
-    number = State()
-
-
-class AddStockAgedGV(StatesGroup):
-    raw_details = State()
+class BulkAddStockSt(StatesGroup):
+    gv_type = State()
+    raw_data = State()
 
 
 class TermsSt(StatesGroup):
@@ -429,7 +480,7 @@ async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
     custom_emoji_id = config.GIFTS_EMOJI_ID
     entities = [MessageEntity(type="custom_emoji", offset=0, length=2, custom_emoji_id=custom_emoji_id)]
-    
+
     welcome_text = f"🎁 Welcome to {config.STORE_NAME}\n\nSelect an option below to buy Google Voice accounts or manage your wallet balance."
     await m.answer(welcome_text, entities=entities, reply_markup=main_menu(m.from_user.id in ADMIN_SET))
 
@@ -688,7 +739,7 @@ async def msg_topup_proof(m: Message, state: FSMContext):
 
     support_username = getattr(config, "SUPPORT_USERNAME", "").lstrip("@")
     support_ref = f"@{support_username}" if support_username else "support"
-    
+
     await m.answer(
         "✅ <b>Payment Proof Submitted!</b>\n\n"
         "⏳ <b>Payment should be processed in 5 to 20 minutes.</b>\n"
@@ -726,7 +777,7 @@ async def msg_topup_proof(m: Message, state: FSMContext):
 @user_router.message(TopUpSt.proof_photo)
 async def msg_topup_proof_invalid(m: Message):
     await m.answer(
-        "⚠️ Please upload a valid image screenshot of your payment proof.",
+        "⚠️️ Please upload a valid image screenshot of your payment proof.",
         reply_markup=kb([[cancel_btn("w")]])
     )
 
@@ -821,8 +872,9 @@ async def cb_terms(c: CallbackQuery):
 def admin_menu() -> InlineKeyboardMarkup:
     return kb([
         [btn("➕ Add Stock", "adm:add_choice", "success"), btn("📦 Active Stock", "adm:ai:0", "primary")],
-        [btn("🛒 Sold Stock", "adm:ss:0", "primary"), btn("💳 Pending Deposits", "adm:pd:0", "primary")],
-        [btn("⚙️ Manage Wallets", "adm:wallets", "primary"), btn("📊 Statistics", "adm:st", "primary")],
+        [btn("🔥 Delete All Stock", "adm:del_all_confirm", "danger"), btn("🛒 Sold Stock", "adm:ss:0", "primary")],
+        [btn("💳 Pending Deposits", "adm:pd:0", "primary"), btn("⚙️️ Manage Wallets", "adm:wallets", "primary")],
+        [btn("📊 Statistics & Data Usage", "adm:st", "primary")],
         [btn("📝 Terms", "adm:tm", "primary")],
         [back("home")],
     ])
@@ -831,7 +883,7 @@ def admin_menu() -> InlineKeyboardMarkup:
 @admin_router.message(Command("admin"))
 async def cmd_admin(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("⚙️ <b>Admin Control Panel</b>", reply_markup=admin_menu())
+    await m.answer("⚙️️ <b>Admin Control Panel</b>", reply_markup=admin_menu())
 
 
 @admin_router.callback_query(F.data.in_({"adm:home", "adm:cancel"}))
@@ -847,7 +899,7 @@ async def cb_admin_home(c: CallbackQuery, state: FSMContext):
 async def cb_admin_wallets(c: CallbackQuery, state: FSMContext):
     await state.clear()
     wallets = await get_active_wallets()
-    lines = ["⚙️ <b>Wallet Addresses Management</b>\n"]
+    lines = ["⚙️️ <b>Wallet Addresses Management</b>\n"]
     rows = []
 
     for key, addr in wallets.items():
@@ -989,110 +1041,124 @@ async def cb_view_deposit(c: CallbackQuery):
     await show(c, text, kb(rows))
 
 
-# ── Stock Management ──
+# ── Stock Management (With Delete Single and Delete All) ──
 
 
 @admin_router.callback_query(F.data == "adm:add_choice")
 async def cb_add_stock_choice(c: CallbackQuery, state: FSMContext):
     await state.clear()
     rows = [
-        [btn(f"🟢 New GV ({money(NEW_GV_PRICE_CENTS)})", "adm:add_new", "success")],
-        [btn(f"📜 Old GV ({money(OLD_GV_PRICE_CENTS)})", "adm:add_old", "primary")],
+        [btn(f"🟢 New GV ({money(NEW_GV_PRICE_CENTS)})", "adm:add_stock:new", "success")],
+        [btn(f"📜 Old GV ({money(OLD_GV_PRICE_CENTS)})", "adm:add_stock:old", "primary")],
         [back("adm:home")],
     ]
     await show(c, "➕ <b>Select Stock Category to Add:</b>", kb(rows))
 
 
-@admin_router.callback_query(F.data == "adm:add_new")
-async def cb_add_new_start(c: CallbackQuery, state: FSMContext):
-    await state.set_state(AddStockFreshGV.email)
-    await show(c, f"➕ <b>Adding New GV ({money(NEW_GV_PRICE_CENTS)})</b>\n\n1️⃣ Enter <b>Email</b>:", kb([[cancel_btn("adm:home")]]))
+@admin_router.callback_query(F.data.startswith("adm:add_stock:"))
+async def cb_bulk_add_stock_start(c: CallbackQuery, state: FSMContext):
+    gv_type = c.data.split(":")[2]
+    await state.update_data(gv_type=gv_type)
+    await state.set_state(BulkAddStockSt.raw_data)
+
+    prompt = (
+        "➕ <b>Add stock</b>\n\n"
+        "<b>Paste accounts, one per line:</b>\n"
+        "email | password | recovery mail | phone number\n\n"
+        "Commas, plain spaces or one-field-per-line all work too – just keep that order "
+        "(email, password, recovery, phone). Duplicates are skipped; new stock goes live instantly.\n\n"
+        "<i>Send /cancel to abort.</i>"
+    )
+    await show(c, prompt, kb([[cancel_btn("adm:home")]]))
 
 
-@admin_router.message(AddStockFreshGV.email, F.text)
-async def msg_fresh_email(m: Message, state: FSMContext):
-    await state.update_data(email=m.text.strip())
-    await state.set_state(AddStockFreshGV.password)
-    await m.answer("2️⃣ Enter <b>Password</b>:", reply_markup=kb([[cancel_btn("adm:home")]]))
+@admin_router.message(BulkAddStockSt.raw_data, F.text)
+async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
+    if m.text.strip().lower() == "/cancel":
+        await state.clear()
+        return await m.answer("❌ Stock addition cancelled.", reply_markup=admin_menu())
 
+    data = await state.get_data()
+    gv_type = data.get("gv_type", "new")
+    price_cents = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
 
-@admin_router.message(AddStockFreshGV.password, F.text)
-async def msg_fresh_pass(m: Message, state: FSMContext):
-    await state.update_data(password=m.text.strip())
-    await state.set_state(AddStockFreshGV.rec_email)
-    await m.answer("3️⃣ Enter <b>Recovery Email</b>:", reply_markup=kb([[cancel_btn("adm:home")]]))
+    parsed_items = parse_gv_lines(m.text)
+    if not parsed_items:
+        return await m.answer("❌ Invalid format or empty text. Please paste accounts in order.", reply_markup=kb([[cancel_btn("adm:home")]]))
 
+    added = 0
+    skipped = 0
+    invalid = 0
 
-@admin_router.message(AddStockFreshGV.rec_email, F.text)
-async def msg_fresh_rec(m: Message, state: FSMContext):
-    await state.update_data(rec_email=m.text.strip())
-    await state.set_state(AddStockFreshGV.number)
-    await m.answer("4️⃣ Enter <b>Phone Number</b>:", reply_markup=kb([[cancel_btn("adm:home")]]))
+    for item in parsed_items:
+        email = item.get("email", "").strip()
+        pwd = item.get("password", "").strip()
+        rec = item.get("rec_email", "").strip()
+        phone = item.get("number", "").strip()
 
+        if not email:
+            invalid += 1
+            continue
 
-@admin_router.message(AddStockFreshGV.number, F.text)
-async def msg_fresh_num(m: Message, state: FSMContext):
-    d = await state.get_data()
+        email_enc = enc(email)
+
+        existing = await db.inventory.find_one({"details.email_enc": email_enc})
+        if existing:
+            skipped += 1
+            continue
+
+        item_prefix = "GVN" if gv_type == "new" else "GVO"
+        item_id = new_id(item_prefix, 6)
+
+        doc = {
+            "item_id": item_id,
+            "gv_type": gv_type,
+            "price_cents": price_cents,
+            "details": {
+                "email_enc": email_enc,
+                "pass_enc": enc(pwd),
+                "rec_enc": enc(rec),
+                "num_enc": enc(phone),
+            },
+            "code_enc": enc(f"{email}|{pwd}|{rec}|{phone}"),
+            "status": "available",
+            "created_at": now(),
+            "added_by": m.from_user.id,
+        }
+        await db.inventory.insert_one(doc)
+        added += 1
+
     await state.clear()
 
-    item_id = new_id("GVN", 6)
-    doc = {
-        "item_id": item_id,
-        "gv_type": "new",
-        "price_cents": NEW_GV_PRICE_CENTS,
-        "details": {
-            "email_enc": enc(d["email"]),
-            "pass_enc": enc(d["password"]),
-            "rec_enc": enc(d["rec_email"]),
-            "num_enc": enc(m.text.strip()),
-        },
-        "status": "available",
-        "created_at": now(),
-        "added_by": m.from_user.id,
-    }
-    await db.inventory.insert_one(doc)
+    live_count = await db.inventory.count_documents({"status": "available"})
+    sold_count = await db.inventory.count_documents({"status": "sold"})
 
-    await m.answer(
-        f"✅ <b>New GV Account Added!</b>\nPrice: {money(NEW_GV_PRICE_CENTS)}\nEmail: <code>{esc(d['email'])}</code>",
-        reply_markup=kb([[btn("➕ Add Another New GV", "adm:add_new", "success")], [back("adm:home")]]),
+    report_text = (
+        f"✔ <b>{added} added live</b> · <b>skipped {skipped} duplicates</b> · <b>{invalid} invalid</b>.\n\n"
+        f"📦 <b>Supplier panel</b>\n\n"
+        f"🟢 Live stock: <b>{live_count}</b> · 🔴 Sold: <b>{sold_count}</b>\n"
+        f"🧩 Products: <b>2</b>"
     )
 
+    reply_markup = kb([
+        [btn("➕ Add stock", "adm:add_choice", "success")],
+        [back("adm:home", "🏠 User menu")]
+    ])
 
-@admin_router.callback_query(F.data == "adm:add_old")
-async def cb_add_old_start(c: CallbackQuery, state: FSMContext):
-    await state.set_state(AddStockAgedGV.raw_details)
-    await show(c, f"➕ <b>Adding Old GV ({money(OLD_GV_PRICE_CENTS)})</b>\n\nPaste credentials string:", kb([[cancel_btn("adm:home")]]))
-
-
-@admin_router.message(AddStockAgedGV.raw_details, F.text)
-async def msg_aged_details(m: Message, state: FSMContext):
-    code = m.text.strip()
-    await state.clear()
-
-    item_id = new_id("GVO", 6)
-    doc = {
-        "item_id": item_id,
-        "gv_type": "old",
-        "price_cents": OLD_GV_PRICE_CENTS,
-        "code_enc": enc(code),
-        "status": "available",
-        "created_at": now(),
-        "added_by": m.from_user.id,
-    }
-    await db.inventory.insert_one(doc)
-
-    await m.answer(
-        f"✅ <b>Old GV Account Listed!</b>\nPrice: {money(OLD_GV_PRICE_CENTS)}",
-        reply_markup=kb([[btn("➕ Add Another Old GV", "adm:add_old", "success")], [back("adm:home")]]),
-    )
+    await m.answer(report_text, reply_markup=reply_markup)
 
 
 @admin_router.callback_query(F.data.startswith("adm:ai:"))
 async def cb_active_stock(c: CallbackQuery):
     page = to_int(c.data.split(":")[2])
     docs, page, pages, total = await page_query(db.inventory, {"status": "available"}, [("created_at", -1)], page, size=PAGE_10)
+
+    if not total:
+        return await show(c, "📦 <b>Active Inventory</b>\n\nNo stock currently available.", kb([[back("adm:home")]]))
+
     rows = [[btn(f"{i['item_id']} · {i.get('gv_type', 'gv').upper()} · {money(i['price_cents'])}", f"adm:ii:{i['item_id']}", "primary")] for i in docs]
     rows += pager("adm:ai", page, pages)
+    rows.append([btn("🔥 Delete All Available Stock", "adm:del_all_confirm", "danger")])
     rows.append([back("adm:home")])
     await show(c, f"📦 <b>Active Inventory</b> ({total} items):", kb(rows))
 
@@ -1104,15 +1170,56 @@ async def cb_active_item_view(c: CallbackQuery):
     if not item:
         return await alert(c, "Item not found.")
 
-    text = f"📦 <b>Item:</b> <code>{item['item_id']}</code>\nType: {item.get('gv_type', 'N/A').upper()}\nPrice: {money(item['price_cents'])}\nStatus: {item['status']}"
-    await show(c, text, kb([[btn("🗑 Delete Item", f"adm:id:{item_id}", "danger")], [back("adm:ai:0")]]))
+    text = (
+        f"📦 <b>Item Details:</b> <code>{item['item_id']}</code>\n\n"
+        f"Type: <b>{item.get('gv_type', 'N/A').upper()}</b>\n"
+        f"Price: <b>{money(item['price_cents'])}</b>\n"
+        f"Status: <b>{item['status']}</b>\n\n"
+        f"<b>Account Credentials:</b>\n"
+        f"{delivery_block(item)}"
+    )
+
+    rows = [
+        [btn("🗑 Delete This GV", f"adm:id:{item_id}", "danger")],
+        [back("adm:ai:0")]
+    ]
+    await show(c, text, kb(rows))
 
 
 @admin_router.callback_query(F.data.startswith("adm:id:"))
 async def cb_delete_item(c: CallbackQuery):
     item_id = c.data.split(":")[2]
     await db.inventory.delete_one({"item_id": item_id})
-    await show(c, "✅ Item deleted from inventory.", kb([[back("adm:ai:0")]]))
+    await alert(c, "✅ Item deleted successfully.")
+    await cb_active_stock(c)
+
+
+@admin_router.callback_query(F.data == "adm:del_all_confirm")
+async def cb_delete_all_confirm(c: CallbackQuery):
+    active_count = await db.inventory.count_documents({"status": "available"})
+    if active_count == 0:
+        return await alert(c, "There is no available stock to delete.")
+
+    text = (
+        f"⚠️ <b>ARE YOU SURE?</b>\n\n"
+        f"You are about to permanently delete <b>{active_count}</b> available Google Voice accounts from the inventory.\n\n"
+        f"This action cannot be undone."
+    )
+    rows = [
+        [btn("🔥 Yes, Delete All GV Stock", "adm:del_all_execute", "danger")],
+        [back("adm:ai:0", "❌ Cancel")]
+    ]
+    await show(c, text, kb(rows))
+
+
+@admin_router.callback_query(F.data == "adm:del_all_execute")
+async def cb_delete_all_execute(c: CallbackQuery):
+    res = await db.inventory.delete_many({"status": "available"})
+    await show(
+        c,
+        f"✅ <b>Successfully deleted {res.deleted_count} available accounts!</b>",
+        kb([[back("adm:home")]])
+    )
 
 
 @admin_router.callback_query(F.data.startswith("adm:ss:"))
@@ -1132,12 +1239,28 @@ async def cb_admin_stats(c: CallbackQuery):
     sold = await db.inventory.count_documents({"status": "sold"})
     pending_dep = await db.payments.count_documents({"status": "pending"})
 
+    # Fetch Network I/O Data Usage statistics
+    net_io = psutil.net_io_counters()
+    bytes_sent = fmt_bytes(net_io.bytes_sent)
+    bytes_recv = fmt_bytes(net_io.bytes_recv)
+    packets_sent = net_io.packets_sent
+    packets_recv = net_io.packets_recv
+
+    # Calculate total revenue from completed orders
+    pipeline = [{"$match": {"status": "completed"}}, {"$group": {"_id": None, "total": {"$sum": "$amount_cents"}}}]
+    rev_res = await db.orders.aggregate(pipeline).to_list(1)
+    rev_cents = rev_res[0]["total"] if rev_res else 0
+
     text = (
-        f"📊 <b>Store Analytics</b>\n\n"
+        f"📊 <b>Store Analytics & Server Data Usage</b>\n\n"
         f"👥 Registered Users: <b>{users}</b>\n"
         f"📦 Active In-Stock Items: <b>{active}</b>\n"
         f"🛒 Total Items Sold: <b>{sold}</b>\n"
-        f"💳 Pending Deposit Verifications: <b>{pending_dep}</b>"
+        f"💰 Total Sales Revenue: <b>{money(rev_cents)}</b>\n"
+        f"💳 Pending Deposit Verifications: <b>{pending_dep}</b>\n\n"
+        f"📡 <b>Server Data Usage Stats:</b>\n"
+        f"⬆️ Total Data Sent: <b>{bytes_sent}</b> ({packets_sent:,} packets)\n"
+        f"⬇️ Total Data Received: <b>{bytes_recv}</b> ({packets_recv:,} packets)"
     )
     await show(c, text, kb([[back("adm:home")]]))
 

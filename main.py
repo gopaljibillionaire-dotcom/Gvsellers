@@ -51,11 +51,11 @@ bot_ref: Optional[Bot] = None
 NEW_GV_PRICE_CENTS = 400  # $4.00
 OLD_GV_PRICE_CENTS = 600  # $6.00
 
-# Image Banners
+# Image Banners (Fixed swapped wallet/orders links)
 IMG_WELCOME = "https://i.ibb.co/3mMm5pk8/file-00000000304481fabc208d5a014f5b11.png"
 IMG_BUY_GV = "https://i.ibb.co/qFBDtRMT/file-00000000543c821195d09ed80ad42f1c.png"
-IMG_ORDERS = "https://i.ibb.co/xKhG0g3D/file-00000000b8b48211b02df47384536e56.png"
 IMG_WALLET = "https://i.ibb.co/Z6NpMbWG/file-0000000056e081fa90ef2c05289f9691.png"
+IMG_ORDERS = "https://i.ibb.co/xKhG0g3D/file-00000000b8b48211b02df47384536e56.png"
 IMG_SUPPORT = "https://i.ibb.co/Bxy6JP8/file-0000000024bc8210a4acf5976393bad9.png"
 IMG_TERMS = "https://i.ibb.co/Q3R5YqjS/file-00000000910c8211957902711cb364f9.png"
 
@@ -133,53 +133,65 @@ def dec(s: str) -> str:
 
 def parse_gv_lines(text: str) -> list[dict[str, str]]:
     """
-    Parses accounts into 5 items: email, password, recovery email, 2fa, phone number.
-    Supports pipe/comma-delimited formats or block newline formatting.
+    Parses account blocks accurately by grouping email, password, recovery email, 2fa, phone number.
+    Supports single-line delimited formats or block newline formatting.
     """
     accounts = []
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    # If pasting in block sequences of 5 parameters per account
-    if len(lines) >= 5 and all(not re.search(r"[|,\t]", line) for line in lines):
-        for i in range(0, len(lines) - len(lines) % 5, 5):
-            accounts.append({
-                "email": lines[i].strip(),
-                "password": lines[i + 1].strip(),
-                "rec_email": lines[i + 2].strip(),
-                "two_fa": lines[i + 3].strip(),
-                "number": lines[i + 4].strip(),
-            })
-        return accounts
-
-    # Single-line delimited input parser
+    # First check single-line pipe/comma/tab formatted lines
+    delimited_lines = []
     for line in lines:
         parts = [p.strip() for p in re.split(r"[|,\t]+", line) if p.strip()]
-        if len(parts) == 1:
-            parts = [p.strip() for p in line.split() if p.strip()]
+        if len(parts) >= 4:
+            delimited_lines.append({
+                "email": parts[0],
+                "password": parts[1],
+                "rec_email": parts[2],
+                "two_fa": parts[3] if len(parts) > 4 else parts[3],
+                "number": parts[4] if len(parts) > 4 else (parts[3] if len(parts) == 4 else ""),
+            })
 
-        if len(parts) >= 5:
+    if delimited_lines:
+        return delimited_lines
+
+    # Group multiline blocks by identifying email start lines
+    current_acc: list[str] = []
+    blocks: list[list[str]] = []
+
+    for line in lines:
+        if "@" in line and not line.startswith("http"):
+            if current_acc:
+                blocks.append(current_acc)
+                current_acc = []
+        current_acc.append(line)
+    if current_acc:
+        blocks.append(current_acc)
+
+    for b in blocks:
+        if len(b) >= 5:
             accounts.append({
-                "email": parts[0],
-                "password": parts[1],
-                "rec_email": parts[2],
-                "two_fa": parts[3],
-                "number": parts[4],
+                "email": b[0],
+                "password": b[1],
+                "rec_email": b[2],
+                "two_fa": b[3],
+                "number": " ".join(b[4:]),
             })
-        elif len(parts) >= 4:
+        elif len(b) == 4:
             accounts.append({
-                "email": parts[0],
-                "password": parts[1],
-                "rec_email": parts[2],
+                "email": b[0],
+                "password": b[1],
+                "rec_email": b[2],
                 "two_fa": "N/A",
-                "number": parts[3],
+                "number": b[3],
             })
-        elif len(parts) >= 1:
+        elif len(b) >= 1:
             accounts.append({
-                "email": parts[0],
-                "password": parts[1] if len(parts) > 1 else "",
-                "rec_email": parts[2] if len(parts) > 2 else "",
-                "two_fa": parts[3] if len(parts) > 3 else "N/A",
-                "number": parts[4] if len(parts) > 4 else "",
+                "email": b[0],
+                "password": b[1] if len(b) > 1 else "",
+                "rec_email": b[2] if len(b) > 2 else "",
+                "two_fa": b[3] if len(b) > 3 else "N/A",
+                "number": b[4] if len(b) > 4 else "",
             })
     return accounts
 
@@ -419,7 +431,7 @@ async def purchase(user_id: int, item_id: str, user_info: str):
 
 
 def delivery_block(item: dict) -> str:
-    """Formatted delivery output block matching user image specification."""
+    """Formatted delivery output block matching exact separate copyable lines requirements."""
     dt = item.get("details", {})
     if dt:
         email = dec(dt.get("email_enc", ""))
@@ -428,17 +440,18 @@ def delivery_block(item: dict) -> str:
         two_fa = dec(dt.get("two_fa_enc", ""))
         phone_num = dec(dt.get("num_enc", ""))
 
-        lines = [esc(email), esc(password), esc(rec_email)]
+        lines = [f"<code>{esc(email)}</code>", f"<code>{esc(password)}</code>", f"<code>{esc(rec_email)}</code>"]
         if two_fa and two_fa != "N/A":
-            lines.append(esc(two_fa))
-        lines.append(esc(phone_num))
+            lines.append(f"<code>{esc(two_fa)}</code>")
+        if phone_num:
+            lines.append(f"<code>{esc(phone_num)}</code>")
 
         formatted_details = "\n".join(lines)
+        return f"🔑 <b>Account Details:</b>\n{formatted_details}"
 
-        return f"🔑 <b>Account Details:</b>\n<code>{formatted_details}</code>"
-
-    code = dec(item.get('code_enc', ''))
-    return f"🔑 <b>Account Details:</b>\n<code>{esc(code)}</code>"
+    code_lines = dec(item.get('code_enc', '')).splitlines()
+    formatted_code = "\n".join([f"<code>{esc(line)}</code>" for line in code_lines if line.strip()])
+    return f"🔑 <b>Account Details:</b>\n{formatted_code}"
 
 
 # ═══════════════════════ MIDDLEWARES & STATES ═══════════════════════
@@ -507,6 +520,7 @@ async def cmd_start(m: Message, state: FSMContext):
     bal = await get_balance(m.from_user.id)
     welcome_text = (
         f"🎁 <b>Welcome to {config.STORE_NAME}</b>\n\n"
+        "ℹ️ <b>Notice:</b> Login guarantee is included upon delivery. If you are unable to login, please contact admin immediately. No guarantee or replacement is provided after login.\n\n"
         f"<b>Your Balance:</b> <b>{money(bal)}</b>\n\n"
         "Select an option below to buy Google Voice accounts or manage your wallet balance."
     )
@@ -520,6 +534,7 @@ async def cb_home(c: CallbackQuery, state: FSMContext):
     bal = await get_balance(c.from_user.id)
     welcome_text = (
         f"🎁 <b>Welcome to {config.STORE_NAME}</b>\n\n"
+        "ℹ️ <b>Notice:</b> Login guarantee is included upon delivery. If you are unable to login, please contact admin immediately. No guarantee or replacement is provided after login.\n\n"
         f"<b>Your Balance:</b> <b>{money(bal)}</b>\n\n"
         "Select an option below to browse products or top up your balance."
     )
@@ -883,7 +898,7 @@ async def msg_support(m: Message, state: FSMContext):
 
 @user_router.callback_query(F.data == "terms")
 async def cb_terms(c: CallbackQuery):
-    terms = await get_setting("terms", config.TERMS_TEXT)
+    terms = await get_setting("terms", "Only login guarantee is provided. If you are not able to login, you can contact admin. No guarantee or replacement after login.")
     text = f"📜 <b>Terms & Conditions</b>\n\n{terms}"
     await show(c, text, kb([[back()]]), photo_url=IMG_TERMS)
 
@@ -1287,7 +1302,7 @@ async def cb_admin_stats(c: CallbackQuery):
 
 @admin_router.callback_query(F.data == "adm:tm")
 async def cb_admin_terms(c: CallbackQuery, state: FSMContext):
-    terms = await get_setting("terms", config.TERMS_TEXT)
+    terms = await get_setting("terms", "Only login guarantee is provided. If you are not able to login, you can contact admin. No guarantee or replacement after login.")
     await state.set_state(TermsSt.text)
     await show(c, f"📝 <b>Edit Terms & Conditions</b>\n\nCurrent terms:\n<i>{terms}</i>\n\nType new text:", kb([[cancel_btn("adm:home")]]))
 

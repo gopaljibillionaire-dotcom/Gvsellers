@@ -1,6 +1,6 @@
 """
 Digital product store bot — Aiogram 3.x + MongoDB (Motor) + Crypto API Payments.
-Includes complete inventory deletion (Single & Bulk Delete) + Data Usage Tracking + Dynamic Banner Images + Quantity Selection.
+Includes complete inventory deletion (Single & Bulk Delete) + Data Usage Tracking + Dynamic Banner Images + Quantity Selection + Full Database Purge + Auto-Space-Split Parsing.
 """
 from __future__ import annotations
 
@@ -132,26 +132,35 @@ def dec(s: str) -> str:
 
 
 def parse_gv_lines(text: str) -> list[dict[str, str]]:
+    """
+    Parses account text inputs. If input contains multiple credentials separated by double spaces
+    or distinct newline entries, splits them into individual standalone GV account items.
+    """
     accounts = []
     text_clean = text.strip()
     if not text_clean:
         return accounts
 
-    if "\n\n" in text_clean:
-        blocks = [b.strip() for b in text_clean.split("\n\n") if b.strip()]
-        for block in blocks:
-            accounts.append({"raw_text": block})
-        return accounts
-
     lines = [line.strip() for line in text_clean.splitlines() if line.strip()]
-    if any(re.search(r"[|,\t]", line) for line in lines):
-        for line in lines:
-            parts = [p.strip() for p in re.split(r"[|,\t]+", line) if p.strip()]
-            if parts:
-                accounts.append({"raw_text": "\n".join(parts)})
-        return accounts
 
-    accounts.append({"raw_text": text_clean})
+    for line in lines:
+        # Check if line contains double spaces or multispaces separating multiple GV credentials
+        if "  " in line:
+            parts = [p.strip() for p in re.split(r"\s{2,}", line) if p.strip()]
+            for p in parts:
+                accounts.append({"raw_text": p})
+        # Check if line has single-space separated multi-account chunks (e.g., email pass email recovery phone)
+        elif len(line.split()) >= 10:
+            # Fallback split on double spaces or tab separators
+            parts = [p.strip() for p in re.split(r"\s\s+|\t+", line) if p.strip()]
+            if len(parts) > 1:
+                for p in parts:
+                    accounts.append({"raw_text": p})
+            else:
+                accounts.append({"raw_text": line})
+        else:
+            accounts.append({"raw_text": line})
+
     return accounts
 
 
@@ -933,6 +942,7 @@ def admin_menu() -> InlineKeyboardMarkup:
         [btn("💳 Pending Deposits", "adm:pd:0", "primary"), btn("⚙ Manage Wallets", "adm:wallets", "primary")],
         [btn("📊 Statistics & Data Usage", "adm:st", "primary")],
         [btn("📝 Terms", "adm:tm", "primary")],
+        [btn("💀 Complete Database Purge", "adm:purge_db_confirm", "danger")],
         [back("home", "🏠 User Menu")],
     ])
 
@@ -947,6 +957,44 @@ async def cmd_admin(m: Message, state: FSMContext):
 async def cb_admin_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await show(c, "⚙️ <b>Admin Control Panel</b>", admin_menu())
+
+
+# ── Complete Database Purge Handler ──
+
+
+@admin_router.callback_query(F.data == "adm:purge_db_confirm")
+async def cb_purge_db_confirm(c: CallbackQuery):
+    text = (
+        "🚨 <b>WARNING: COMPLETE DATABASE PURGE</b> 🚨\n\n"
+        "You are about to completely delete <b>ALL</b> data in the database:\n"
+        "• All user profiles & user money/balances\n"
+        "• All active inventory stock\n"
+        "• All order history\n"
+        "• All deposit and transaction records\n\n"
+        "<b>THIS ACTION IS IRREVERSIBLE!</b> Are you absolutely sure?"
+    )
+    rows = [
+        [btn("💀 YES, PURGE ENTIRE DATABASE", "adm:purge_db_execute", "danger")],
+        [back("adm:home", "❌ Cancel / Go Back")]
+    ]
+    await show(c, text, kb(rows))
+
+
+@admin_router.callback_query(F.data == "adm:purge_db_execute")
+async def cb_purge_db_execute(c: CallbackQuery):
+    # Purge all collections
+    await db.users.delete_many({})
+    await db.wallets.delete_many({})
+    await db.wallet_transactions.delete_many({})
+    await db.inventory.delete_many({})
+    await db.orders.delete_many({})
+    await db.payments.delete_many({})
+
+    await show(
+        c,
+        "💥 <b>DATABASE COMPLETE PURGE SUCCESSFUL!</b>\n\nAll users, money balances, stock inventory, and transaction histories have been wiped.",
+        kb([[back("adm:home")]])
+    )
 
 
 # ── Admin Dynamic Wallet Management ──
@@ -1107,7 +1155,8 @@ async def cb_bulk_add_stock_start(c: CallbackQuery, state: FSMContext):
     prompt = (
         "➕ <b>Add stock</b>\n\n"
         "<b>Send or paste raw account text:</b>\n"
-        "Paste account credentials as they are. The bot will deliver the entire message block exactly as provided to buyers upon purchase.\n\n"
+        "Paste account credentials as they are. The bot will deliver the entire message block exactly as provided to buyers upon purchase.\n"
+        "<i>Note: Items separated by double spaces will automatically be imported as separate accounts!</i>\n\n"
         "<i>Send /cancel to abort.</i>"
     )
     await show(c, prompt, kb([[cancel_btn("adm:home")]]))

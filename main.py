@@ -88,19 +88,21 @@ if getattr(config, "GEMINI_API_KEY", None) and config.GEMINI_API_KEY != "YOUR_GE
 
 
 async def parse_gv_lines_with_gemini(text: str) -> list[dict[str, Any]]:
-    """Uses Gemini AI to parse raw GV dumps into detailed structured records."""
+    """Uses Gemini AI to split bulk GV text lines/blocks into structured account objects."""
     if not gemini_client or not text.strip():
         return parse_gv_lines_fallback(text)
 
     prompt = (
-        "Extract Google Voice / Google Account details from the provided raw text.\n"
-        "Analyze each account block/line and return a JSON list of objects. Each object MUST contain:\n"
-        "- email: primary google email\n"
-        "- password: primary email password\n"
-        "- rec_email: recovery email (or 'N/A')\n"
-        "- rec_pass_2fa: recovery password or 2FA key (or 'N/A')\n"
-        "- phone: phone number attached (or 'N/A')\n\n"
-        "Raw text to parse:\n" + text
+        "Extract each individual Google Voice account block from the raw input text.\n"
+        "Input may contain single-line accounts or multi-line blocks.\n"
+        "Return a JSON list of objects where each object corresponds to EXACTLY ONE account record with these fields:\n"
+        "- email: primary Gmail/Google email\n"
+        "- password: password for primary email\n"
+        "- rec_email: recovery email\n"
+        "- rec_pass_2fa: 2FA codes, app passwords, or 2FA backup keys (preserve original string spaces)\n"
+        "- phone: phone number (e.g. (802) 962-0651 or similar format)\n"
+        "- raw_line: full raw unparsed line/string for exact text delivery\n\n"
+        "Raw text data:\n" + text
     )
 
     try:
@@ -122,7 +124,8 @@ async def parse_gv_lines_with_gemini(text: str) -> list[dict[str, Any]]:
                     "password": item.get("password", "N/A"),
                     "rec_email": item.get("rec_email", "N/A"),
                     "rec_pass_2fa": item.get("rec_pass_2fa", "N/A"),
-                    "phone": item.get("phone", "N/A")
+                    "phone": item.get("phone", "N/A"),
+                    "raw_line": item.get("raw_line", "").strip()
                 })
             return parsed_accounts
     except Exception as e:
@@ -146,7 +149,8 @@ def parse_gv_lines_fallback(text: str) -> list[dict[str, Any]]:
             "password": password,
             "rec_email": rec_email,
             "rec_pass_2fa": "N/A",
-            "phone": phone
+            "phone": phone,
+            "raw_line": line
         })
     return accounts
 
@@ -271,7 +275,7 @@ def new_id(prefix: str, nbytes: int) -> str:
 
 
 def money(cents: int) -> str:
-    return f"{config.CURRENCY_SYMBOL}{cents / 100:,.2f}"
+    return f"${cents / 100:,.2f}"
 
 
 def fmt_dt(d: Optional[datetime]) -> str:
@@ -518,8 +522,13 @@ async def fulfill_order(user_id: int, gv_type: str, qty: int, track_id: str) -> 
 
 
 def delivery_block(item: dict) -> str:
-    """Formats full GV account metadata parsed by Gemini AI."""
+    """Formats full GV account metadata as plain unescaped text line matching provided picture."""
     dt = item.get("details", {})
+    if dt and dt.get("raw_line_enc"):
+        raw_text = dec(dt["raw_line_enc"])
+        if raw_text:
+            return esc(raw_text)
+
     if dt:
         email = dec(dt.get("email_enc", ""))
         password = dec(dt.get("pass_enc", ""))
@@ -527,17 +536,10 @@ def delivery_block(item: dict) -> str:
         rec_pass_2fa = dec(dt.get("rec_pass_2fa_enc", ""))
         phone = dec(dt.get("phone_enc", ""))
 
-        content = (
-            f"📧 <b>Gmail:</b> <code>{esc(email)}</code>\n"
-            f"🔑 <b>Password:</b> <code>{esc(password)}</code>\n"
-            f"📩 <b>Recovery Email:</b> <code>{esc(rec_email)}</code>\n"
-            f"🔐 <b>2FA / Recovery Pass:</b> <code>{esc(rec_pass_2fa)}</code>\n"
-            f"📱 <b>Phone:</b> <code>{esc(phone)}</code>"
-        )
-    else:
-        content = f"<code>{esc(dec(item.get('code_enc', '')))}</code>"
+        parts = [p for p in [email, password, rec_email, rec_pass_2fa, phone] if p and p != "N/A"]
+        return esc(" ".join(parts))
 
-    return content
+    return esc(dec(item.get('code_enc', '')))
 
 
 # ═══════════════════════ MIDDLEWARES & STATES ═══════════════════════
@@ -662,7 +664,7 @@ async def msg_topup_amount(m: Message, state: FSMContext):
         rows.append(row_btns)
 
     rows.append([btn("🌐 Pay with Other Currency", f"pay_topup_panel:{cents}", "success")])
-    rows.append([back("home", "⬅️️ Back")])
+    rows.append([back("home", "⬅ Back")])
 
     await m.answer_photo(photo=IMG_TOPUP_WALLET, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb(rows))
 
@@ -892,30 +894,23 @@ async def cb_buy_with_balance(c: CallbackQuery):
         await db.users.update_one({"user_id": uid}, {"$inc": {"balance_cents": total_cents}})
         return await alert(c, f"❌ Purchase failed: {err}. Your balance was refunded.")
 
-    # Send order summary first
-    summary_text = (
-        f"✅ <b>Purchase Successful! Order Delivered!</b>\n\n"
-        f"<b>Order ID:</b> <code>{order['order_id']}</code>\n"
-        f"<b>Quantity:</b> {qty}\n"
-        f"<b>Amount Paid:</b> {money(total_cents)}\n"
-        f"<b>Remaining Balance:</b> {money(res.get('balance_cents', 0))}\n\n"
-        f"📦 <i>Delivering your {qty} account(s) below one-by-one...</i>"
-    )
-    await show(c, summary_text, photo_url=IMG_ORDERS)
+    # Format delivered layout matching sample picture
+    delivery_lines = [delivery_block(item) for item in items]
 
-    # Send each GV detail one by one to the user
-    for idx, item in enumerate(items, 1):
-        item_text = f"<b>Account #{idx} of {qty}:</b>\n\n{delivery_block(item)}"
-        await safe_send(uid, text=item_text, parse_mode=ParseMode.HTML)
-
-    # Final menu message
-    done_text = "🎉 <b>All accounts have been delivered above!</b>"
-    await safe_send(
-        uid,
-        text=done_text,
-        reply_markup=kb([[back("ol:0", "📦 View My Orders"), back("home", "🏠 Main Menu")]]),
-        parse_mode=ParseMode.HTML
+    text = (
+        f"✅ <b>Purchase Successful!</b>\n\n"
+        f"<b>Order ID: {order['order_id']}</b>\n"
+        f"<b>Amount Deducted: {money(total_cents)}</b>\n\n"
+        f"<b>Delivered Account Details:</b>\n"
+        f"🔑 <b>Account Details:</b>\n"
+        + "\n".join(delivery_lines)
     )
+
+    order_markup = kb([
+        [btn("📦 My Orders", "ol:0", "primary"), btn("🏠 Home", "home", "primary")]
+    ])
+
+    await show(c, text, order_markup)
 
 
 def support_button():
@@ -1003,19 +998,22 @@ async def cb_order_view(c: CallbackQuery):
     if not o:
         return await alert(c, "Order record missing.")
 
-    text = (
-        f"<b>Order ID: {o['order_id']}</b>\n"
-        f"<b>Product: {o['product_name']}</b>\n"
-        f"<b>Amount Paid: {money(o['amount_cents'])}</b>\n\n"
-        f"🔑 <b>Delivered Account Details:</b>\n\n"
-    )
-
+    delivered_text = ""
     if o.get("item_ids"):
         items = await db.inventory.find({"item_id": {"$in": o["item_ids"]}}).to_list(len(o["item_ids"]))
-        for idx, item in enumerate(items, 1):
-            text += f"<b>Account #{idx}:</b>\n{delivery_block(item)}\n\n"
+        delivered_lines = [delivery_block(item) for item in items]
+        delivered_text = "\n".join(delivered_lines)
 
-    await show(c, text, kb([[back("ol:0")]]), photo_url=IMG_ORDERS)
+    text = (
+        f"✅ <b>Purchase Successful!</b>\n\n"
+        f"<b>Order ID: {o['order_id']}</b>\n"
+        f"<b>Amount Deducted: {money(o['amount_cents'])}</b>\n\n"
+        f"<b>Delivered Account Details:</b>\n"
+        f"🔑 <b>Account Details:</b>\n"
+        f"{delivered_text}"
+    )
+
+    await show(c, text, kb([[back("ol:0")]]))
 
 
 @user_router.callback_query(F.data == "sup")
@@ -1133,7 +1131,7 @@ async def cb_bulk_add_stock_start(c: CallbackQuery, state: FSMContext):
     prompt = (
         "➕ <b>Add Bulk Stock (Gemini AI Enabled)</b>\n\n"
         "<b>Send or paste bulk account dump:</b>\n"
-        "Gemini AI will parse, structure, and format each account with Gmail, Password, Recovery Email, 2FA, and Phone Number separately."
+        "Gemini AI will separate each individual account line or block into separate stock entries."
     )
     await show(c, prompt, kb([[cancel_btn("adm:home")]]))
 
@@ -1148,7 +1146,7 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
     gv_type = data.get("gv_type", "new")
     price_cents = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
 
-    processing_msg = await m.answer("🧠 <i>Gemini AI is parsing Gmail, Recovery Email, 2FA & Phone Numbers...</i>", parse_mode=ParseMode.HTML)
+    processing_msg = await m.answer("🧠 <i>Gemini AI is parsing and splitting account entries...</i>", parse_mode=ParseMode.HTML)
 
     parsed_items = await parse_gv_lines_with_gemini(m.text)
     if not parsed_items:
@@ -1160,14 +1158,16 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
 
     for item in parsed_items:
         email = item.get("email", "")
-        if not email or email == "N/A":
-            continue
+        raw_line = item.get("raw_line", "")
 
-        email_enc = enc(email)
-        existing = await db.inventory.find_one({"details.email_enc": email_enc})
-        if existing:
-            skipped += 1
-            continue
+        if email and email != "N/A":
+            email_enc = enc(email)
+            existing = await db.inventory.find_one({"details.email_enc": email_enc})
+            if existing:
+                skipped += 1
+                continue
+        else:
+            email_enc = enc("N/A")
 
         item_prefix = "GVN" if gv_type == "new" else "GVO"
         item_id = new_id(item_prefix, 6)
@@ -1181,7 +1181,8 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
                 "pass_enc": enc(item.get("password", "N/A")),
                 "rec_enc": enc(item.get("rec_email", "N/A")),
                 "rec_pass_2fa_enc": enc(item.get("rec_pass_2fa", "N/A")),
-                "phone_enc": enc(item.get("phone", "N/A"))
+                "phone_enc": enc(item.get("phone", "N/A")),
+                "raw_line_enc": enc(raw_line)
             },
             "status": "available",
             "created_at": now(),

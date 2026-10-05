@@ -73,7 +73,7 @@ OLD_GV_PRICE_CENTS = 600  # $6.00
 
 # Banners
 IMG_WELCOME = "https://i.ibb.co/3mMm5pk8/file-00000000304481fabc208d5a014f5b11.png"
-IMG_TOPUP_WALLET = "https://i.ibb.co/3mMm5pk8/file-00000000304481fabc208d5a014f5b11.png"
+IMG_TOPUP_WALLET = "https://i.ibb.co/Z6NpMbWG/file-0000000056e081fa90ef2c05289f9691.png"
 IMG_BUY_GV = "https://i.ibb.co/qFBDtRMT/file-00000000543c821195d09ed80ad42f1c.png"
 IMG_ORDERS = "https://i.ibb.co/Z6NpMbWG/file-0000000056e081fa90ef2c05289f9691.png"
 IMG_SUPPORT = "https://i.ibb.co/Bxy6JP8/file-0000000024bc8210a4acf5976393bad9.png"
@@ -368,7 +368,6 @@ def pager(prefix: str, page: int, pages: int) -> list:
 
 def main_menu(admin: bool, user_balance: int = 0) -> InlineKeyboardMarkup:
     rows = [
-        [btn(f"💳 Wallet Balance: {money(user_balance)}", "topup_wallet", "primary")],
         [btn("🛍 Buy Google Voice", "pl:0", "success")],
         [btn("📦 My Orders", "ol:0", "primary"), btn("💳 Top-Up Wallet", "topup_wallet", "success")],
         [btn("💬 Contact Support", "sup", "success"), btn("📜 Terms", "terms", "primary")],
@@ -663,7 +662,7 @@ async def msg_topup_amount(m: Message, state: FSMContext):
         rows.append(row_btns)
 
     rows.append([btn("🌐 Pay with Other Currency", f"pay_topup_panel:{cents}", "success")])
-    rows.append([back("home", "⬅️ Back")])
+    rows.append([back("home", "⬅️️ Back")])
 
     await m.answer_photo(photo=IMG_TOPUP_WALLET, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb(rows))
 
@@ -893,15 +892,30 @@ async def cb_buy_with_balance(c: CallbackQuery):
         await db.users.update_one({"user_id": uid}, {"$inc": {"balance_cents": total_cents}})
         return await alert(c, f"❌ Purchase failed: {err}. Your balance was refunded.")
 
-    accounts_str = "\n\n".join(f"<b>Account #{i}:</b>\n{delivery_block(item)}" for i, item in enumerate(items, 1))
-    text = (
+    # Send order summary first
+    summary_text = (
         f"✅ <b>Purchase Successful! Order Delivered!</b>\n\n"
         f"<b>Order ID:</b> <code>{order['order_id']}</code>\n"
+        f"<b>Quantity:</b> {qty}\n"
         f"<b>Amount Paid:</b> {money(total_cents)}\n"
         f"<b>Remaining Balance:</b> {money(res.get('balance_cents', 0))}\n\n"
-        f"{accounts_str}"
+        f"📦 <i>Delivering your {qty} account(s) below one-by-one...</i>"
     )
-    await show(c, text, kb([[back("ol:0", "📦 View My Orders"), back("home", "🏠 Main Menu")]]), photo_url=IMG_ORDERS)
+    await show(c, summary_text, photo_url=IMG_ORDERS)
+
+    # Send each GV detail one by one to the user
+    for idx, item in enumerate(items, 1):
+        item_text = f"<b>Account #{idx} of {qty}:</b>\n\n{delivery_block(item)}"
+        await safe_send(uid, text=item_text, parse_mode=ParseMode.HTML)
+
+    # Final menu message
+    done_text = "🎉 <b>All accounts have been delivered above!</b>"
+    await safe_send(
+        uid,
+        text=done_text,
+        reply_markup=kb([[back("ol:0", "📦 View My Orders"), back("home", "🏠 Main Menu")]]),
+        parse_mode=ParseMode.HTML
+    )
 
 
 def support_button():
@@ -960,7 +974,7 @@ async def cb_check_payment(c: CallbackQuery):
     result = await process_payment_update(info)
     msgs = {
         "delivered": "✅ Payment confirmed! Your wallet balance has been updated.",
-        "partial": "⚠️️ Partial payment received. Please send the remaining amount to the same address.",
+        "partial": "⚠ Partial payment received. Please send the remaining amount to the same address.",
         "review": "🔎 Payment detected and sent to support for quick verification.",
     }
     await alert(c, msgs.get(result, "⏳ No confirmed payment yet. Wait for blockchain confirmation and try again in a minute."))

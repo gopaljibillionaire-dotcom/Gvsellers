@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import hashlib
 import html
 import json
@@ -136,45 +137,57 @@ def parse_gv_lines_fallback(text: str) -> list[dict[str, Any]]:
 
 
 async def create_oxapay_static_address(user_id: int, currency: str, amount_usd: float) -> Optional[dict]:
-    """Generates an automatic white-label payment address for a specific currency."""
+    """Generates an automatic white-label payment address pre-selected for a specific currency."""
     payload = {
         "merchant": config.OXAPAY_MERCHANT_KEY,
-        "currency": currency.upper(),
         "amount": amount_usd,
-        "lifeTime": 60,  # Valid for 60 minutes
+        "currency": "USD",
+        "payCurrency": currency.upper(),
+        "lifeTime": 60,
         "feePaidByPayer": 0,
         "callbackUrl": f"{config.WEBHOOK_URL}/oxapay/callback",
-        "description": f"Order payment for User {user_id}"
+        "description": f"Order payment for User {user_id}",
+        "orderId": f"USER_{user_id}_{int(datetime.now().timestamp())}"
     }
+
+    url = getattr(config, "OXAPAY_WHITE_LABEL_URL", "https://api.oxapay.com/merchants/request/whitelabel")
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(config.OXAPAY_WHITE_LABEL_URL, json=payload, timeout=10) as resp:
+            async with session.post(url, json=payload, timeout=12) as resp:
                 data = await resp.json()
                 if data.get("result") == 100:
                     return data
+                log.error("OxaPay Address Error details: %s", data)
     except Exception as e:
         log.error("OxaPay API Error (White Label): %s", e)
     return None
 
 
-async def create_oxapay_full_invoice(user_id: int, amount_usd: float) -> Optional[str]:
-    """Generates a full OxaPay Hosted Checkout Panel link where users can choose any crypto."""
+async def create_oxapay_full_invoice(user_id: int, amount_usd: float, currency: Optional[str] = None) -> Optional[dict]:
+    """Generates a full OxaPay Hosted Checkout Panel invoice link (supporting full panel pre-fills)."""
     payload = {
         "merchant": config.OXAPAY_MERCHANT_KEY,
         "amount": amount_usd,
         "currency": "USD",
         "lifeTime": 60,
         "callbackUrl": f"{config.WEBHOOK_URL}/oxapay/callback",
-        "description": f"Multi-currency checkout for User {user_id}"
+        "description": f"Multi-currency checkout for User {user_id}",
+        "orderId": f"USER_{user_id}_{int(datetime.now().timestamp())}"
     }
+    
+    if currency:
+        payload["payCurrency"] = currency.upper()
+
+    url = getattr(config, "OXAPAY_CREATE_INVOICE_URL", "https://api.oxapay.com/merchants/request")
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(config.OXAPAY_CREATE_INVOICE_URL, json=payload, timeout=10) as resp:
+            async with session.post(url, json=payload, timeout=12) as resp:
                 data = await resp.json()
                 if data.get("result") == 100:
-                    return data.get("payLink")
+                    return data
+                log.error("OxaPay Invoice Error details: %s", data)
     except Exception as e:
         log.error("OxaPay API Error (Invoice): %s", e)
     return None
@@ -388,13 +401,12 @@ async def set_setting(key: str, value: Any):
 
 
 async def fulfill_order(user_id: int, gv_type: str, qty: int, track_id: str) -> tuple[Optional[dict], Optional[list], Optional[str]]:
-    """Fulfills order after automatic payment confirmation by fetching requested stock items without deleting remaining inventory."""
+    """Fulfills order after automatic payment confirmation by fetching requested stock items."""
     unit_price = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
     total_cents = unit_price * qty
     gv_title = "New GV" if gv_type == "new" else "Old GV"
     t = now()
 
-    # Fetch ONLY requested quantity
     available_items = await db.inventory.find(
         {"gv_type": gv_type, "status": "available"}
     ).limit(qty).to_list(qty)
@@ -404,7 +416,6 @@ async def fulfill_order(user_id: int, gv_type: str, qty: int, track_id: str) -> 
 
     item_ids = [item["item_id"] for item in available_items]
 
-    # Mark ONLY selected items as sold
     oid = new_id("ORD", 5)
     await db.inventory.update_many(
         {"item_id": {"$in": item_ids}},
@@ -425,7 +436,7 @@ async def fulfill_order(user_id: int, gv_type: str, qty: int, track_id: str) -> 
     await db.orders.insert_one(order)
 
     admin_alert = Text(
-        CustomEmoji("🛍", custom_emoji_id=config.STORE_EMOJI_ID), " ", Bold("Auto-Payment Received & Fulfilled!"), "\n\n",
+        CustomEmoji("🛍", custom_emoji_id=getattr(config, "STORE_EMOJI_ID", "5373142232980331089")), " ", Bold("Auto-Payment Received & Fulfilled!"), "\n\n",
         f"<b>Order ID:</b> <code>{oid}</code>\n",
         f"<b>Buyer ID:</b> <code>{user_id}</code>\n",
         f"<b>Product:</b> {gv_title} x{qty}\n",
@@ -629,20 +640,18 @@ async def render_gv_payment_options(ev, user_id: int, gv_type: str, qty: int):
     text = (
         f"🛍 <b>Order Summary: {gv_title}</b>\n\n"
         f"Quantity: <b>{qty}</b>\n"
-        f"Total Amount: <b>{money(total_cents)}</b>\n\n"
-        "⚡ <b>Select Automatic Payment Currency:</b>\n"
-        "Click a top coin below to get an automatic payment address or select <b>Pay with Other Currency</b>:"
+        f"Total Amount: <b>{money(total_cents)}</b> (${total_usd:.2f} USD)\n\n"
+        "⚡ <b>Select Payment Method:</b>\n"
+        "Choose a crypto coin below to generate a deposit address or open the full OxaPay panel:"
     )
 
     rows = []
-    # Display Top 10 Currencies in rows of 2
-    top_coins = config.TOP_10_CURRENCIES
+    top_coins = getattr(config, "TOP_10_CURRENCIES", ["BTC", "LTC", "USDT", "TRX", "ETH", "BNB"])
     for i in range(0, len(top_coins), 2):
         pair = top_coins[i:i+2]
         row_btns = [btn(f"Pay in {coin}", f"pay_auto:{gv_type}:{qty}:{coin}", "primary") for coin in pair]
         rows.append(row_btns)
 
-    # Multi-Currency Panel Option
     rows.append([btn("🌐 Pay with Other Currency (Full Panel)", f"pay_panel:{gv_type}:{qty}", "success")])
     rows.append([back(f"gv_select:{gv_type}", "⬅️ Back")])
 
@@ -657,40 +666,74 @@ async def cb_pay_auto(c: CallbackQuery):
     total_usd = (unit_cents * qty) / 100.0
 
     await c.answer("Generating OxaPay address...")
+
+    # First attempt White-Label static address API
     resp = await create_oxapay_static_address(c.from_user.id, currency, total_usd)
 
-    if not resp or not resp.get("address"):
-        return await alert(c, "Failed to generate payment address. Please try another currency.")
+    if resp and resp.get("address"):
+        addr = resp["address"]
+        crypto_amount = resp.get("payAmount", "N/A")
+        track_id = str(resp.get("trackId", ""))
 
-    addr = resp["address"]
-    crypto_amount = resp.get("payAmount", "N/A")
-    track_id = resp.get("trackId")
+        await db.payments.update_one(
+            {"track_id": track_id},
+            {"$set": {
+                "track_id": track_id,
+                "user_id": c.from_user.id,
+                "gv_type": gv_type,
+                "quantity": qty,
+                "amount_cents": unit_cents * qty,
+                "currency": currency,
+                "status": "pending",
+                "created_at": now()
+            }},
+            upsert=True
+        )
 
-    # Store pending transaction for Webhook Auto Verification
-    await db.payments.update_one(
-        {"track_id": track_id},
-        {"$set": {
-            "track_id": track_id,
-            "user_id": c.from_user.id,
-            "gv_type": gv_type,
-            "quantity": qty,
-            "amount_cents": unit_cents * qty,
-            "currency": currency,
-            "status": "pending",
-            "created_at": now()
-        }},
-        upsert=True
-    )
+        text = (
+            f"⚡ <b>Automatic OxaPay Payment ({currency.upper()})</b>\n\n"
+            f"💰 Send Amount: <code>{crypto_amount}</code> <b>{currency.upper()}</b>\n"
+            f"📍 Send To Address:\n<code>{addr}</code>\n\n"
+            f"⌛ <i>This address expires in 60 minutes. Once payment is confirmed on the blockchain, your accounts will be delivered instantly!</i>"
+        )
+        rows = [[back("home", "🏠 Return to Main Menu")]]
+        return await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
-    text = (
-        f"⚡ <b>Automatic OxaPay Payment</b>\n\n"
-        f"Send exactly: <code>{crypto_amount}</code> <b>{currency.upper()}</b>\n"
-        f"To Address:\n<code>{addr}</code>\n\n"
-        f"⌛ <i>This address expires in 60 minutes. Once payment is confirmed on the blockchain, your accounts will be delivered instantly!</i>"
-    )
+    # Fallback to hosted checkout pre-filled with selected currency
+    invoice = await create_oxapay_full_invoice(c.from_user.id, total_usd, currency=currency)
+    if invoice and invoice.get("payLink"):
+        pay_link = invoice["payLink"]
+        track_id = str(invoice.get("trackId", ""))
 
-    rows = [[back("home", "🏠 Return to Main Menu")]]
-    await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
+        await db.payments.update_one(
+            {"track_id": track_id},
+            {"$set": {
+                "track_id": track_id,
+                "user_id": c.from_user.id,
+                "gv_type": gv_type,
+                "quantity": qty,
+                "amount_cents": unit_cents * qty,
+                "currency": currency,
+                "status": "pending",
+                "created_at": now()
+            }},
+            upsert=True
+        )
+
+        text = (
+            f"⚡ <b>OxaPay Hosted Checkout Panel</b>\n\n"
+            f"Amount: <b>${total_usd:.2f} USD</b>\n"
+            f"Selected Coin: <b>{currency.upper()}</b>\n\n"
+            "Click <b>Pay Now</b> below to open the payment gateway panel:"
+        )
+
+        rows = [
+            [btn(f"💵 Pay {currency.upper()} Now", url=pay_link, style="success")],
+            [back("home", "🏠 Main Menu")]
+        ]
+        return await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
+
+    await alert(c, "Failed to generate OxaPay payment. Check API Keys or try again.")
 
 
 @user_router.callback_query(F.data.startswith("pay_panel:"))
@@ -701,15 +744,33 @@ async def cb_pay_panel(c: CallbackQuery):
     total_usd = (unit_cents * qty) / 100.0
 
     await c.answer("Creating payment invoice...")
-    pay_link = await create_oxapay_full_invoice(c.from_user.id, total_usd)
+    invoice = await create_oxapay_full_invoice(c.from_user.id, total_usd)
 
-    if not pay_link:
+    if not invoice or not invoice.get("payLink"):
         return await alert(c, "Failed to connect to OxaPay. Please try again.")
+
+    pay_link = invoice["payLink"]
+    track_id = str(invoice.get("trackId", ""))
+
+    await db.payments.update_one(
+        {"track_id": track_id},
+        {"$set": {
+            "track_id": track_id,
+            "user_id": c.from_user.id,
+            "gv_type": gv_type,
+            "quantity": qty,
+            "amount_cents": unit_cents * qty,
+            "currency": "MULTI",
+            "status": "pending",
+            "created_at": now()
+        }},
+        upsert=True
+    )
 
     text = (
         f"🌐 <b>OxaPay Multi-Currency Checkout</b>\n\n"
         f"Amount: <b>${total_usd:.2f} USD</b>\n\n"
-        "Click the button below to open the payment page and choose from 30+ supported cryptocurrencies:"
+        "Click the button below to open the full payment panel:"
     )
 
     rows = [
@@ -784,7 +845,7 @@ async def msg_support(m: Message, state: FSMContext):
 
 @user_router.callback_query(F.data == "terms")
 async def cb_terms(c: CallbackQuery):
-    terms = await get_setting("terms", config.TERMS_TEXT)
+    terms = await get_setting("terms", getattr(config, "TERMS_TEXT", "Standard terms apply."))
     text = f"📜 <b>Terms & Conditions</b>\n\n{terms}"
     await show(c, text, kb([[back()]]), photo_url=IMG_TERMS)
 
@@ -962,7 +1023,7 @@ async def cb_delete_all_confirm(c: CallbackQuery):
         return await alert(c, "There is no available stock to delete.")
 
     text = (
-        f"⚠️️ <b>ARE YOU SURE?</b>\n\n"
+        f"⚠ <b>ARE YOU SURE?</b>\n\n"
         f"You are about to permanently delete <b>{active_count}</b> available Google Voice accounts.\n\n"
         f"This action cannot be undone."
     )
@@ -1017,7 +1078,7 @@ async def cb_admin_stats(c: CallbackQuery):
 
 @admin_router.callback_query(F.data == "adm:tm")
 async def cb_admin_terms(c: CallbackQuery, state: FSMContext):
-    terms = await get_setting("terms", config.TERMS_TEXT)
+    terms = await get_setting("terms", getattr(config, "TERMS_TEXT", "Standard terms apply."))
     await state.set_state(TermsSt.text)
     await show(c, f"📝 <b>Edit Terms & Conditions</b>\n\nCurrent terms:\n<i>{terms}</i>\n\nType new text:", kb([[cancel_btn("adm:home")]]))
 
@@ -1032,14 +1093,30 @@ async def msg_terms_update(m: Message, state: FSMContext):
 # ════════════════════════ OXAPAY WEBHOOK SERVER ════════════════════════
 
 
+def verify_oxapay_hmac(body_bytes: bytes, hmac_header: Optional[str]) -> bool:
+    """Verifies HMAC signature sent by OxaPay webhooks."""
+    if not hmac_header:
+        return True
+    api_key = getattr(config, "OXAPAY_API_KEY", config.OXAPAY_MERCHANT_KEY)
+    calculated = hmac.new(api_key.encode('utf-8'), body_bytes, hashlib.sha512).hexdigest()
+    return hmac.compare_digest(calculated, hmac_header)
+
+
 async def handle_oxapay_webhook(request):
     """Processes incoming payment webhooks from OxaPay and fulfills orders automatically."""
     try:
-        data = await request.json()
-        status = data.get("status")
-        track_id = data.get("trackId")
+        raw_body = await request.read()
+        hmac_hdr = request.headers.get("HMAC") or request.headers.get("X-HMAC-SHA512")
+        
+        if not verify_oxapay_hmac(raw_body, hmac_hdr):
+            log.warning("Unauthorized webhook request received.")
+            return web.json_response({"status": "unauthorized"}, status=401)
 
-        if status == "Paid" and track_id:
+        data = json.loads(raw_body.decode('utf-8'))
+        status = str(data.get("status", "")).lower()
+        track_id = str(data.get("trackId", ""))
+
+        if status in ("paid", "completed", "100") and track_id:
             payment = await db.payments.find_one({"track_id": track_id, "status": "pending"})
             if payment:
                 await db.payments.update_one({"track_id": track_id}, {"$set": {"status": "completed"}})
@@ -1078,12 +1155,11 @@ async def main():
     dp.include_router(admin_router)
     dp.include_router(user_router)
 
-    # Webhook server for OxaPay Auto Payment Callbacks
     app = web.Application()
     app.router.add_post("/oxapay/callback", handle_oxapay_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", config.WEBHOOK_PORT)
+    site = web.TCPSite(runner, "0.0.0.0", getattr(config, "WEBHOOK_PORT", 8080))
     await site.start()
 
     try:

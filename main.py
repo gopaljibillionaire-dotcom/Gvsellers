@@ -49,20 +49,19 @@ ADMIN_SET = set(config.ADMIN_IDS)
 PAGE_10 = 10
 MAX_PRICE_CENTS = 10_000_000
 
-# ── Config helpers: values come from config.py (which reads Heroku Config Vars) or straight from env ──
+# ── Config helpers ──
 def _cfg(name: str) -> str:
     val = getattr(config, name, None) or os.environ.get(name) or ""
     return str(val).strip()
 
 
-# OxaPay v1 uses ONE key: the "Merchant API key" (OxaPay Dashboard -> Merchants -> API key).
 OXAPAY_API_KEY = _cfg("OXAPAY_API_KEY") or _cfg("OXAPAY_MERCHANT_KEY") or _cfg("OXAPAY_MERCHANT_API_KEY")
 WEBHOOK_BASE = _cfg("WEBHOOK_URL").rstrip("/")
 OXAPAY_BASE_URL = "https://api.oxapay.com/v1"
 OXAPAY_CALLBACK_URL = f"{WEBHOOK_BASE}/oxapay/callback"
 OXAPAY_TO_CURRENCY = _cfg("OXAPAY_TO_CURRENCY") or "USDT"
 OXAPAY_SANDBOX = _cfg("OXAPAY_SANDBOX").lower() in ("1", "true", "yes")
-UNDERPAY_TOLERANCE = Decimal("0.02")  # accept 2% less on static-address payments (network/rounding)
+UNDERPAY_TOLERANCE = Decimal("0.02")  # accept 2% less on static-address payments
 STABLE_COINS = {"USDT", "USDC", "DAI"}
 
 mongo: Any = None
@@ -74,6 +73,7 @@ OLD_GV_PRICE_CENTS = 600  # $6.00
 
 # Banners
 IMG_WELCOME = "https://i.ibb.co/3mMm5pk8/file-00000000304481fabc208d5a014f5b11.png"
+IMG_TOPUP_WALLET = "https://i.ibb.co/3mMm5pk8/file-00000000304481fabc208d5a014f5b11.png"
 IMG_BUY_GV = "https://i.ibb.co/qFBDtRMT/file-00000000543c821195d09ed80ad42f1c.png"
 IMG_ORDERS = "https://i.ibb.co/Z6NpMbWG/file-0000000056e081fa90ef2c05289f9691.png"
 IMG_SUPPORT = "https://i.ibb.co/Bxy6JP8/file-0000000024bc8210a4acf5976393bad9.png"
@@ -153,8 +153,6 @@ def parse_gv_lines_fallback(text: str) -> list[dict[str, Any]]:
 
 # ════════════════════════════ OXAPAY API INTEGRATION (v1) ════════════════════════════
 
-# Coin -> candidate OxaPay network names (first one that OxaPay accepts is cached).
-# You can override in config.py with OXAPAY_NETWORKS = {"USDT": "TRON", ...}
 OXAPAY_NETWORKS: dict[str, list[str]] = {
     "BTC": ["Bitcoin", "Bitcoin Network"],
     "LTC": ["Litecoin", "Litecoin Network"],
@@ -171,7 +169,6 @@ _network_cache: dict[str, str] = {}
 
 
 async def _oxapay_request(method: str, path: str, payload: Optional[dict] = None) -> tuple[Optional[dict], str]:
-    """Call the OxaPay v1 API. Returns (data, error_message)."""
     if not OXAPAY_API_KEY:
         return None, "OxaPay API key is missing (set OXAPAY_API_KEY in Heroku Config Vars)."
 
@@ -205,18 +202,13 @@ async def _oxapay_post(path: str, payload: dict) -> tuple[Optional[dict], str]:
 
 
 async def fetch_payment_info(track_id: str) -> tuple[Optional[dict], str]:
-    """GET /v1/payment/{track_id} - current status + transactions of a payment."""
     return await _oxapay_request("GET", f"/payment/{track_id}")
 
 
 async def create_oxapay_static_address(user_id: int, coin: str, order_id: str) -> tuple[Optional[dict], str]:
-    """Creates a static deposit address for one coin/network (POST /v1/payment/static-address)."""
     coin = coin.upper()
     override = (getattr(config, "OXAPAY_NETWORKS", None) or {}).get(coin)
-    if isinstance(override, str):
-        candidates = [override]
-    else:
-        candidates = list(override or OXAPAY_NETWORKS.get(coin, [coin]))
+    candidates = [override] if isinstance(override, str) else list(override or OXAPAY_NETWORKS.get(coin, [coin]))
     cached = _network_cache.get(coin)
     if cached:
         candidates = [cached] + [n for n in candidates if n != cached]
@@ -229,7 +221,7 @@ async def create_oxapay_static_address(user_id: int, coin: str, order_id: str) -
             "auto_withdrawal": False,
             "callback_url": OXAPAY_CALLBACK_URL,
             "order_id": order_id,
-            "description": f"Order for user {user_id}",
+            "description": f"Top-up for user {user_id}",
         }
         data, err = await _oxapay_post("/payment/static-address", payload)
         if data and data.get("address"):
@@ -241,7 +233,6 @@ async def create_oxapay_static_address(user_id: int, coin: str, order_id: str) -
 
 
 async def create_oxapay_full_invoice(user_id: int, amount_usd: float, order_id: str) -> tuple[Optional[dict], str]:
-    """Creates a hosted checkout invoice (POST /v1/payment/invoice). Result has track_id + payment_url."""
     payload = {
         "amount": round(float(amount_usd), 2),
         "currency": "USD",
@@ -254,8 +245,8 @@ async def create_oxapay_full_invoice(user_id: int, amount_usd: float, order_id: 
         "callback_url": OXAPAY_CALLBACK_URL,
         "return_url": _cfg("RETURN_URL") or WEBHOOK_BASE or "https://t.me",
         "order_id": order_id,
-        "thanks_message": "Payment received! Your accounts will be delivered in the bot.",
-        "description": f"Order for user {user_id}",
+        "thanks_message": "Payment received! Your wallet has been topped up.",
+        "description": f"Wallet top-up for user {user_id}",
         "sandbox": OXAPAY_SANDBOX,
     }
     data, err = await _oxapay_post("/payment/invoice", payload)
@@ -375,10 +366,11 @@ def pager(prefix: str, page: int, pages: int) -> list:
     return [row]
 
 
-def main_menu(admin: bool) -> InlineKeyboardMarkup:
+def main_menu(admin: bool, user_balance: int = 0) -> InlineKeyboardMarkup:
     rows = [
+        [btn(f"💳 Wallet Balance: {money(user_balance)}", "topup_wallet", "primary")],
         [btn("🛍 Buy Google Voice", "pl:0", "success")],
-        [btn("📦 My Orders", "ol:0", "primary")],
+        [btn("📦 My Orders", "ol:0", "primary"), btn("💳 Top-Up Wallet", "topup_wallet", "success")],
         [btn("💬 Contact Support", "sup", "success"), btn("📜 Terms", "terms", "primary")],
     ]
     if admin:
@@ -471,6 +463,11 @@ async def set_setting(key: str, value: Any):
     await db.settings.update_one({"key": key}, {"$set": {"value": value, "updated_at": now()}}, upsert=True)
 
 
+async def get_user_balance(user_id: int) -> int:
+    u = await db.users.find_one({"user_id": user_id})
+    return u.get("balance_cents", 0) if u else 0
+
+
 # ═══════════════════════════ INVENTORY & FULFILLMENT ═══════════════════════════
 
 
@@ -510,7 +507,7 @@ async def fulfill_order(user_id: int, gv_type: str, qty: int, track_id: str) -> 
     await db.orders.insert_one(order)
 
     admin_alert = Text(
-        CustomEmoji("🛍", custom_emoji_id=getattr(config, "STORE_EMOJI_ID", "5373142232980331089")), " ", Bold("Auto-Payment Received & Fulfilled!"), "\n\n",
+        CustomEmoji("🛍", custom_emoji_id=getattr(config, "STORE_EMOJI_ID", "5373142232980331089")), " ", Bold("Order Fulfilled!"), "\n\n",
         f"<b>Order ID:</b> <code>{oid}</code>\n",
         f"<b>Buyer ID:</b> <code>{user_id}</code>\n",
         f"<b>Product:</b> {gv_title} x{qty}\n",
@@ -555,7 +552,7 @@ class UserMiddleware(BaseMiddleware):
         doc = await db.users.find_one_and_update(
             {"user_id": u.id},
             {"$set": {"username": u.username, "first_name": u.first_name, "last_seen": now()},
-             "$setOnInsert": {"created_at": now(), "banned": False}},
+             "$setOnInsert": {"created_at": now(), "banned": False, "balance_cents": 0}},
             upsert=True, return_document=ReturnDocument.AFTER,
         )
         data["db_user"] = doc
@@ -570,6 +567,10 @@ class IsAdmin(BaseFilter):
 
 class BuyGVSt(StatesGroup):
     custom_qty = State()
+
+
+class TopUpSt(StatesGroup):
+    amount = State()
 
 
 class BulkAddStockSt(StatesGroup):
@@ -596,27 +597,143 @@ admin_router.callback_query.filter(IsAdmin())
 @user_router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
+    user_bal = await get_user_balance(m.from_user.id)
     welcome_text = (
         f"🎁 <b>Welcome to {config.STORE_NAME}</b>\n\n"
-        "Select an option below to buy Google Voice accounts instantly via automatic Crypto payments."
+        f"💳 Your Wallet Balance: <b>{money(user_bal)}</b>\n\n"
+        "Select an option below to buy Google Voice accounts or top up your wallet balance."
     )
-    await m.answer_photo(photo=IMG_WELCOME, caption=welcome_text, parse_mode=ParseMode.HTML, reply_markup=main_menu(m.from_user.id in ADMIN_SET))
+    await m.answer_photo(photo=IMG_WELCOME, caption=welcome_text, parse_mode=ParseMode.HTML, reply_markup=main_menu(m.from_user.id in ADMIN_SET, user_bal))
 
 
 @user_router.callback_query(F.data == "home")
 @user_router.callback_query(F.data == "cancel")
 async def cb_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
+    user_bal = await get_user_balance(c.from_user.id)
     welcome_text = (
         f"🎁 <b>Welcome to {config.STORE_NAME}</b>\n\n"
+        f"💳 Your Wallet Balance: <b>{money(user_bal)}</b>\n\n"
         "Select an option below to browse products or complete orders."
     )
-    await show(c, welcome_text, main_menu(c.from_user.id in ADMIN_SET), photo_url=IMG_WELCOME)
+    await show(c, welcome_text, main_menu(c.from_user.id in ADMIN_SET, user_bal), photo_url=IMG_WELCOME)
 
 
 @user_router.callback_query(F.data == "noop")
 async def cb_noop(c: CallbackQuery):
     await c.answer()
+
+
+# ── Wallet Top-Up Handlers ──
+
+
+@user_router.callback_query(F.data == "topup_wallet")
+async def cb_topup_wallet(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(TopUpSt.amount)
+    user_bal = await get_user_balance(c.from_user.id)
+    text = (
+        f"💳 <b>Top-Up Wallet Balance</b>\n\n"
+        f"Current Balance: <b>{money(user_bal)}</b>\n\n"
+        "Please type the custom amount in USD you want to add to your wallet (e.g. <code>10</code> or <code>25.50</code>):"
+    )
+    await show(c, text, kb([[cancel_btn("home")]]), photo_url=IMG_TOPUP_WALLET)
+
+
+@user_router.message(TopUpSt.amount, F.text)
+async def msg_topup_amount(m: Message, state: FSMContext):
+    cents = parse_money(m.text)
+    if not cents or cents < 100:  # Minimum top-up $1.00
+        return await m.answer("❌ Minimum top-up amount is $1.00. Please enter a valid amount (e.g. 10 or 25.50):", reply_markup=kb([[cancel_btn("home")]]))
+
+    await state.clear()
+    total_usd = cents / 100.0
+    
+    text = (
+        f"💳 <b>Top-Up Wallet: ${total_usd:.2f} USD</b>\n\n"
+        "⚡ <b>Select Deposit Method:</b>\n"
+        "Choose a crypto coin below to generate a deposit address or open the full OxaPay panel:"
+    )
+
+    rows = []
+    top_coins = getattr(config, "TOP_10_CURRENCIES", ["BTC", "LTC", "USDT", "TRX", "ETH", "BNB"])
+    for i in range(0, len(top_coins), 2):
+        pair = top_coins[i:i+2]
+        row_btns = [btn(f"Pay in {coin}", f"pay_topup_auto:{cents}:{coin}", "primary") for coin in pair]
+        rows.append(row_btns)
+
+    rows.append([btn("🌐 Pay with Other Currency", f"pay_topup_panel:{cents}", "success")])
+    rows.append([back("home", "⬅️ Back")])
+
+    await m.answer_photo(photo=IMG_TOPUP_WALLET, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb(rows))
+
+
+@user_router.callback_query(F.data.startswith("pay_topup_auto:"))
+async def cb_pay_topup_auto(c: CallbackQuery):
+    _, cents_str, coin = c.data.split(":")
+    cents = to_int(cents_str)
+    coin = coin.upper()
+    total_usd = cents / 100.0
+    uid = c.from_user.id
+    order_ref = f"TOP-{uid}-{secrets.token_hex(4)}"
+
+    data, err_msg = await create_oxapay_static_address(uid, coin, order_ref)
+    if data:
+        addr = data["address"]
+        network = data.get("network", coin)
+        track_id = str(data.get("track_id", ""))
+        await save_pending_payment(track_id, order_ref, uid, "topup", 1, cents, coin, "static")
+
+        text = (
+            f"⚡ <b>Top-Up Wallet via {esc(coin)}</b>\n\n"
+            f"💵 Top-Up Amount: <b>${total_usd:.2f} USD</b>\n"
+            f"🌐 Network: <b>{esc(network)}</b>\n\n"
+            f"📍 Deposit Address:\n<code>{esc(addr)}</code>\n\n"
+            f"⚠️ Send <b>at least ${total_usd:.2f}</b> worth of <b>{esc(coin)}</b> on the <b>{esc(network)}</b> network only.\n\n"
+            f"✅ Your wallet balance will update automatically once confirmed."
+        )
+        row1 = []
+        if coin in STABLE_COINS:
+            row1.append(btn("📋 Copy Amount", copy=f"{total_usd:.2f}"))
+        row1.append(btn("📋 Copy Address", copy=str(addr)))
+        rows = [row1, [check_button(track_id)], [back("home", "❌ Back To Menu"), support_button()]]
+        return await show(c, text, kb(rows), photo_url=IMG_TOPUP_WALLET)
+
+    invoice, inv_err = await create_oxapay_full_invoice(uid, total_usd, order_ref)
+    if invoice:
+        track_id = str(invoice.get("track_id", ""))
+        await save_pending_payment(track_id, order_ref, uid, "topup", 1, cents, "MULTI", "invoice")
+        text = (
+            f"🧾 <b>Wallet Top-Up Invoice</b>\n\n"
+            f"💵 Amount: <b>${total_usd:.2f} USD</b>\n\n"
+            "Tap <b>Pay Now</b> to complete your payment. Balance will be added automatically."
+        )
+        return await show(c, text, invoice_markup(track_id, invoice["payment_url"]), photo_url=IMG_TOPUP_WALLET)
+
+    await alert(c, f"OxaPay Error: {inv_err or err_msg or 'Could not create payment'}")
+
+
+@user_router.callback_query(F.data.startswith("pay_topup_panel:"))
+async def cb_pay_topup_panel(c: CallbackQuery):
+    _, cents_str = c.data.split(":")
+    cents = to_int(cents_str)
+    total_usd = cents / 100.0
+    uid = c.from_user.id
+    order_ref = f"TOP-{uid}-{secrets.token_hex(4)}"
+
+    invoice, err_msg = await create_oxapay_full_invoice(uid, total_usd, order_ref)
+    if not invoice:
+        return await alert(c, f"OxaPay Error: {err_msg}")
+
+    track_id = str(invoice.get("track_id", ""))
+    await save_pending_payment(track_id, order_ref, uid, "topup", 1, cents, "MULTI", "invoice")
+
+    text = (
+        f"🧾 <b>Wallet Top-Up Invoice</b>\n\n"
+        f"💵 Amount: <b>${total_usd:.2f} USD</b>\n\n"
+        "Tap <b>Pay Now</b> to complete your payment. Balance will be credited automatically upon confirmation."
+    )
+    await show(c, text, invoice_markup(track_id, invoice["payment_url"]), photo_url=IMG_TOPUP_WALLET)
 
 
 # ── Products Catalog & Quantity Selection ──
@@ -695,7 +812,7 @@ async def cb_gv_checkout(c: CallbackQuery, state: FSMContext):
     await render_gv_payment_options(c, c.from_user.id, gv_type, qty)
 
 
-# ── Automatic Payment Generation ──
+# ── Purchase Logic (Wallet Check & Direct Buy / Top Up) ──
 
 
 async def render_gv_payment_options(ev, user_id: int, gv_type: str, qty: int):
@@ -705,35 +822,86 @@ async def render_gv_payment_options(ev, user_id: int, gv_type: str, qty: int):
     gv_title = "New GV" if gv_type == "new" else "Old GV"
 
     available_count = await db.inventory.count_documents({"gv_type": gv_type, "status": "available"})
-
     if available_count < qty:
         text = f"❌ <b>Not enough stock!</b> Required: <b>{qty}</b>, Available: <b>{available_count}</b>."
         rows = [[back(f"gv_select:{gv_type}", "⬅️ Change Quantity")]]
         return await show(ev, text, kb(rows), photo_url=IMG_BUY_GV)
 
+    user_bal = await get_user_balance(user_id)
+
+    # 1. User HAS enough balance to pay directly
+    if user_bal >= total_cents:
+        text = (
+            f"🛍 <b>Order Summary: {gv_title}</b>\n\n"
+            f"Quantity: <b>{qty}</b>\n"
+            f"Total Amount: <b>{money(total_cents)}</b> (${total_usd:.2f} USD)\n"
+            f"Your Wallet Balance: <b>{money(user_bal)}</b>\n\n"
+            "✅ You have sufficient wallet balance to make this purchase instantly!"
+        )
+        rows = [
+            [btn("⚡ Buy Now (Pay with Balance)", f"buy_bal:{gv_type}:{qty}", "success")],
+            [back(f"gv_select:{gv_type}", "⬅️ Back")]
+        ]
+        return await show(ev, text, kb(rows), photo_url=IMG_BUY_GV)
+
+    # 2. User DOES NOT have enough balance -> Show Top Up button
+    needed_cents = total_cents - user_bal
     text = (
         f"🛍 <b>Order Summary: {gv_title}</b>\n\n"
         f"Quantity: <b>{qty}</b>\n"
-        f"Total Amount: <b>{money(total_cents)}</b> (${total_usd:.2f} USD)\n\n"
-        "⚡ <b>Select Payment Method:</b>\n"
-        "Choose a crypto coin below to generate a deposit address or open the full OxaPay panel:"
+        f"Total Amount: <b>{money(total_cents)}</b> (${total_usd:.2f} USD)\n"
+        f"Your Wallet Balance: <b>{money(user_bal)}</b>\n\n"
+        f"⚠️ <b>Insufficient Wallet Balance!</b>\n"
+        f"You need <b>{money(needed_cents)}</b> more in your balance to complete this purchase.\n\n"
+        "Click <b>Top-Up Wallet</b> below to add custom balance via Crypto."
     )
 
-    rows = []
-    top_coins = getattr(config, "TOP_10_CURRENCIES", ["BTC", "LTC", "USDT", "TRX", "ETH", "BNB"])
-    for i in range(0, len(top_coins), 2):
-        pair = top_coins[i:i+2]
-        row_btns = [btn(f"Pay in {coin}", f"pay_auto:{gv_type}:{qty}:{coin}", "primary") for coin in pair]
-        rows.append(row_btns)
-
-    rows.append([btn("🌐 Pay with Other Currency (Full Panel)", f"pay_panel:{gv_type}:{qty}", "success")])
-    rows.append([back(f"gv_select:{gv_type}", "⬅️ Back")])
-
-    await show(ev, text, kb(rows), photo_url=IMG_BUY_GV)
+    rows = [
+        [btn("💳 Top-Up Wallet", "topup_wallet", "success")],
+        [back(f"gv_select:{gv_type}", "⬅️ Back")]
+    ]
+    await show(ev, text, kb(rows), photo_url=IMG_TOPUP_WALLET)
 
 
-def new_order_ref(user_id: int) -> str:
-    return f"GV{user_id}-{secrets.token_hex(4)}"
+@user_router.callback_query(F.data.startswith("buy_bal:"))
+async def cb_buy_with_balance(c: CallbackQuery):
+    _, gv_type, qty_str = c.data.split(":")
+    qty = to_int(qty_str)
+    unit_cents = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
+    total_cents = unit_cents * qty
+    uid = c.from_user.id
+
+    user_bal = await get_user_balance(uid)
+    if user_bal < total_cents:
+        return await alert(c, "❌ Insufficient wallet balance. Please top up your wallet.")
+
+    # Deduct balance atomically
+    res = await db.users.find_one_and_update(
+        {"user_id": uid, "balance_cents": {"$gte": total_cents}},
+        {"$inc": {"balance_cents": -total_cents}},
+        return_document=ReturnDocument.AFTER
+    )
+    if not res:
+        return await alert(c, "❌ Balance error or insufficient funds.")
+
+    # Fulfill stock
+    track_id = f"BAL-{secrets.token_hex(4)}"
+    order, items, err = await fulfill_order(uid, gv_type, qty, track_id)
+
+    if not order or not items:
+        # Refund if stock vanished
+        await db.users.update_one({"user_id": uid}, {"$inc": {"balance_cents": total_cents}})
+        return await alert(c, f"❌ Purchase failed: {err}. Your balance was refunded.")
+
+    accounts_str = "\n\n".join(f"<b>Account #{i}:</b>\n{delivery_block(item)}" for i, item in enumerate(items, 1))
+    text = (
+        f"✅ <b>Purchase Successful! Order Delivered!</b>\n\n"
+        f"<b>Order ID:</b> <code>{order['order_id']}</code>\n"
+        f"<b>Amount Paid:</b> {money(total_cents)}\n"
+        f"<b>Remaining Balance:</b> {money(res.get('balance_cents', 0))}\n\n"
+        f"{accounts_str}"
+    )
+    await show(c, text, kb([[back("ol:0", "📦 View My Orders"), back("home", "🏠 Main Menu")]]), photo_url=IMG_ORDERS)
 
 
 def support_button():
@@ -751,7 +919,7 @@ async def save_pending_payment(track_id: str, order_ref: str, user_id: int, gv_t
         {"$set": {
             "track_id": track_id,
             "order_ref": order_ref,
-            "kind": kind,  # "static" or "invoice"
+            "kind": kind,
             "user_id": user_id,
             "gv_type": gv_type,
             "quantity": qty,
@@ -774,109 +942,14 @@ def invoice_markup(track_id: str, pay_url: str):
     ])
 
 
-@user_router.callback_query(F.data.startswith("pay_auto:"))
-async def cb_pay_auto(c: CallbackQuery):
-    """User picked a specific coin -> create a fresh deposit address for exactly that coin."""
-    _, gv_type, qty_str, coin = c.data.split(":")
-    qty = to_int(qty_str)
-    if qty < 1:
-        return await alert(c, "Invalid quantity.")
-    coin = coin.upper()
-    unit_cents = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
-    total_cents = unit_cents * qty
-    total_usd = total_cents / 100.0
-    uid = c.from_user.id
-    order_ref = new_order_ref(uid)
-
-    # 1) Static deposit address for the chosen coin
-    data, err_msg = await create_oxapay_static_address(uid, coin, order_ref)
-    if data:
-        addr = data["address"]
-        network = data.get("network", coin)
-        track_id = str(data.get("track_id", ""))
-        try:
-            await save_pending_payment(track_id, order_ref, uid, gv_type, qty, total_cents, coin, "static")
-        except Exception as e:
-            log.exception("Could not save payment: %s", e)
-            return await alert(c, "Database error - please try again in a moment.")
-
-        text = (
-            f"⚡ <b>Pay with {esc(coin)}</b>\n\n"
-            f"💵 Order Total: <b>${total_usd:.2f} USD</b>\n"
-            f"🌐 Network: <b>{esc(network)}</b>\n\n"
-            f"📍 Deposit Address:\n<code>{esc(addr)}</code>\n\n"
-            f"⚠️ Send <b>at least ${total_usd:.2f}</b> worth of <b>{esc(coin)}</b> on the <b>{esc(network)}</b> network only. "
-            f"Any other coin or network will be lost.\n\n"
-            f"✅ Delivery is automatic once the payment is confirmed. You can also tap <b>Check Payment</b> after sending."
-        )
-        row1 = []
-        if coin in STABLE_COINS:
-            row1.append(btn("📋 Copy Amount", copy=f"{total_usd:.2f}"))
-        row1.append(btn("📋 Copy Address", copy=str(addr)))
-        rows = [row1, [check_button(track_id)], [back("home", "❌ Back To Menu"), support_button()]]
-        return await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
-
-    # 2) Fallback: hosted invoice link
-    log.warning("Static address failed for %s (%s) - falling back to invoice", coin, err_msg)
-    invoice, inv_err = await create_oxapay_full_invoice(uid, total_usd, order_ref)
-    if invoice:
-        track_id = str(invoice.get("track_id", ""))
-        try:
-            await save_pending_payment(track_id, order_ref, uid, gv_type, qty, total_cents, "MULTI", "invoice")
-        except Exception as e:
-            log.exception("Could not save payment: %s", e)
-            return await alert(c, "Database error - please try again in a moment.")
-        text = (
-            f"🧾 <b>Payment Invoice</b>\n\n"
-            f"💵 Amount: <b>${total_usd:.2f} USD</b>\n\n"
-            "Tap <b>Pay Now</b> to complete your payment. Delivery is automatic once it is confirmed."
-        )
-        return await show(c, text, invoice_markup(track_id, invoice["payment_url"]), photo_url=IMG_BUY_GV)
-
-    await alert(c, f"OxaPay Error: {inv_err or err_msg or 'Could not create payment'}")
-
-
-@user_router.callback_query(F.data.startswith("pay_panel:"))
-async def cb_pay_panel(c: CallbackQuery):
-    """Full OxaPay checkout page where the payer picks any coin."""
-    _, gv_type, qty_str = c.data.split(":")
-    qty = to_int(qty_str)
-    if qty < 1:
-        return await alert(c, "Invalid quantity.")
-    unit_cents = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
-    total_cents = unit_cents * qty
-    total_usd = total_cents / 100.0
-    uid = c.from_user.id
-    order_ref = new_order_ref(uid)
-
-    invoice, err_msg = await create_oxapay_full_invoice(uid, total_usd, order_ref)
-    if not invoice:
-        return await alert(c, f"OxaPay Error: {err_msg}")
-
-    track_id = str(invoice.get("track_id", ""))
-    try:
-        await save_pending_payment(track_id, order_ref, uid, gv_type, qty, total_cents, "MULTI", "invoice")
-    except Exception as e:
-        log.exception("Could not save payment: %s", e)
-        return await alert(c, "Database error - please try again in a moment.")
-
-    text = (
-        f"🧾 <b>Payment Invoice</b>\n\n"
-        f"💵 Amount: <b>${total_usd:.2f} USD</b>\n\n"
-        "Tap <b>Pay Now</b>, choose your coin and pay. Delivery is automatic once it is confirmed."
-    )
-    await show(c, text, invoice_markup(track_id, invoice["payment_url"]), photo_url=IMG_BUY_GV)
-
-
 @user_router.callback_query(F.data.startswith("chk:"))
 async def cb_check_payment(c: CallbackQuery):
-    """Manual 'Check Payment' button - asks OxaPay directly, no webhook needed."""
     track_id = c.data.split(":", 1)[1]
     p = await db.gv_payments.find_one({"track_id": track_id, "user_id": c.from_user.id})
     if not p:
         return await alert(c, "Payment not found.")
     if p["status"] == "completed":
-        return await alert(c, "✅ This payment is already confirmed and delivered.")
+        return await alert(c, "✅ This payment is already confirmed and credited.")
     if p["status"] != "pending":
         return await alert(c, "This payment needs support attention. Please contact support.")
 
@@ -886,8 +959,8 @@ async def cb_check_payment(c: CallbackQuery):
     info["track_id"] = track_id
     result = await process_payment_update(info)
     msgs = {
-        "delivered": "✅ Payment confirmed! Your accounts are being delivered.",
-        "partial": "⚠️ Partial payment received. Please send the remaining amount to the same address.",
+        "delivered": "✅ Payment confirmed! Your wallet balance has been updated.",
+        "partial": "⚠️️ Partial payment received. Please send the remaining amount to the same address.",
         "review": "🔎 Payment detected and sent to support for quick verification.",
     }
     await alert(c, msgs.get(result, "⏳ No confirmed payment yet. Wait for blockchain confirmation and try again in a minute."))
@@ -969,7 +1042,8 @@ async def cb_terms(c: CallbackQuery):
 def admin_menu() -> InlineKeyboardMarkup:
     return kb([
         [btn("➕ Add Stock", "adm:add_choice", "success"), btn("📦 Active Stock", "adm:ai:0", "primary")],
-        [btn("🔥 Delete All Stock", "adm:del_all_confirm", "danger"), btn("🛒 Sold Stock", "adm:ss:0", "primary")],
+        [btn("🔥 Delete Available Stock", "adm:del_all_confirm", "danger"), btn("🛒 Sold Stock", "adm:ss:0", "primary")],
+        [btn("💣 PURGE ALL BOT DATA", "adm:purge_confirm", "danger")],
         [btn("📊 Statistics & Data Usage", "adm:st", "primary")],
         [btn("📝 Terms", "adm:tm", "primary")],
         [back("home", "🏠 User Menu")],
@@ -986,6 +1060,40 @@ async def cmd_admin(m: Message, state: FSMContext):
 async def cb_admin_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await show(c, "⚙️ <b>Admin Control Panel</b>", admin_menu())
+
+
+# ── Complete Purge System ──
+
+
+@admin_router.callback_query(F.data == "adm:purge_confirm")
+async def cb_purge_confirm(c: CallbackQuery):
+    text = (
+        "🚨 <b>WARNING: COMPLETE SYSTEM PURGE</b> 🚨\n\n"
+        "You are about to wipe **ALL DATA** from the store bot database:\n"
+        "• All Stock (Available & Sold)\n"
+        "• All User Data & Wallet Balances\n"
+        "• All Order History\n"
+        "• All Pending & Past Payment Logs\n"
+        "• All Settings\n\n"
+        "<b>THIS CANNOT BE UNDONE!</b> Are you absolutely sure?"
+    )
+    rows = [
+        [btn("💣 YES, PURGE EVERYTHING NOW", "adm:purge_execute", "danger")],
+        [back("adm:home", "❌ Cancel & Go Back")]
+    ]
+    await show(c, text, kb(rows))
+
+
+@admin_router.callback_query(F.data == "adm:purge_execute")
+async def cb_purge_execute(c: CallbackQuery):
+    await db.inventory.delete_many({})
+    await db.orders.delete_many({})
+    await db.gv_payments.delete_many({})
+    await db.users.delete_many({})
+    await db.settings.delete_many({})
+
+    text = "✅ <b>COMPLETE PURGE SUCCESSFUL!</b>\n\nAll inventory, orders, users, payments, and settings have been completely deleted."
+    await show(c, text, kb([[back("adm:home")]]))
 
 
 # ── Stock Management (Integrated with Gemini AI Parser) ──
@@ -1141,7 +1249,7 @@ async def cb_delete_all_confirm(c: CallbackQuery):
         f"This action cannot be undone."
     )
     rows = [
-        [btn("🔥 Yes, Delete All GV Stock", "adm:del_all_execute", "danger")],
+        [btn("🔥 Yes, Delete All Available Stock", "adm:del_all_execute", "danger")],
         [back("adm:ai:0", "❌ Cancel")]
     ]
     await show(c, text, kb(rows))
@@ -1207,16 +1315,10 @@ async def msg_terms_update(m: Message, state: FSMContext):
 
 
 def verify_oxapay_hmac(body_bytes: bytes, hmac_header: Optional[str]) -> bool:
-    """OxaPay signs the raw body with HMAC-SHA512 using your merchant API key (header: HMAC)."""
     if not hmac_header or not OXAPAY_API_KEY:
         return False
     calculated = hmac.new(OXAPAY_API_KEY.encode("utf-8"), body_bytes, hashlib.sha512).hexdigest()
     return hmac.compare_digest(calculated, hmac_header.strip())
-
-
-async def notify_admins(text: str):
-    for admin_id in ADMIN_SET:
-        await safe_send(admin_id, text=text, parse_mode=ParseMode.HTML)
 
 
 def _dec(v: Any) -> Decimal:
@@ -1230,7 +1332,6 @@ PAID_TX_STATUSES = {"confirmed", "paid", "completed"}
 
 
 def extract_static_txs(data: dict) -> list[tuple[str, Decimal]]:
-    """Returns [(tx_hash, usd_value)] for confirmed incoming transactions of a static address."""
     out: list[tuple[str, Decimal]] = []
     for tx in data.get("txs") or []:
         if not isinstance(tx, dict):
@@ -1248,46 +1349,48 @@ def extract_static_txs(data: dict) -> list[tuple[str, Decimal]]:
     return out
 
 
-async def deliver_payment(payment: dict, track_id: str):
-    """Marks the payment completed (atomically, once) and delivers the stock."""
+async def credit_user_wallet(payment: dict, track_id: str):
+    """Credits the user balance automatically upon payment confirmation."""
     claimed = await db.gv_payments.find_one_and_update(
         {"track_id": track_id, "status": "pending"},
         {"$set": {"status": "completed", "completed_at": now()}},
         return_document=ReturnDocument.BEFORE,
     )
     if not claimed:
-        return  # already processed by another webhook / poll / button press
-
-    order, items, err = await fulfill_order(payment["user_id"], payment["gv_type"], payment["quantity"], track_id)
-    if order and items:
-        accounts_str = "\n\n".join(f"<b>Account #{i}:</b>\n{delivery_block(item)}" for i, item in enumerate(items, 1))
-        await safe_send(
-            payment["user_id"],
-            text=(
-                f"✅ <b>Payment Received! Order Delivered!</b>\n\n"
-                f"<b>Order ID:</b> <code>{order['order_id']}</code>\n\n{accounts_str}"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
         return
 
-    await db.gv_payments.update_one({"track_id": track_id}, {"$set": {"status": "paid_unfulfilled", "error": err}})
+    uid = payment["user_id"]
+    amount_cents = payment["amount_cents"]
+
+    # Credit balance
+    user_doc = await db.users.find_one_and_update(
+        {"user_id": uid},
+        {"$inc": {"balance_cents": amount_cents}},
+        return_document=ReturnDocument.AFTER,
+    )
+
+    new_bal = user_doc.get("balance_cents", 0) if user_doc else amount_cents
+
     await safe_send(
-        payment["user_id"],
-        text="⚠️ <b>Payment received</b>, but we could not deliver your order automatically. Support has been notified and will fix this shortly.",
+        uid,
+        text=(
+            f"✅ <b>Payment Confirmed! Wallet Topped Up!</b>\n\n"
+            f"<b>Credited:</b> {money(amount_cents)}\n"
+            f"<b>New Wallet Balance:</b> {money(new_bal)}\n\n"
+            f"You can now purchase Google Voice accounts directly using your balance."
+        ),
         parse_mode=ParseMode.HTML,
     )
-    await notify_admins(
-        f"🚨 <b>Paid but NOT delivered</b>\nUser: <code>{payment['user_id']}</code>\nTrack ID: <code>{track_id}</code>\nReason: {esc(err)}"
+
+    admin_alert = Text(
+        CustomEmoji("💳", custom_emoji_id=getattr(config, "STORE_EMOJI_ID", "5373142232980331089")), " ", Bold("Wallet Top-Up Confirmed!"), "\n\n",
+        f"<b>User ID:</b> <code>{uid}</code>\n",
+        f"<b>Amount Topped Up:</b> {money(amount_cents)}"
     )
+    await notify_admins(content=admin_alert)
 
 
 async def process_payment_update(data: dict) -> str:
-    """
-    Single entry point used by the webhook, the background poller and the Check Payment button.
-    `data` must contain track_id + OxaPay payment fields.
-    Returns: ignored | waiting | partial | review | delivered
-    """
     track_id = str(data.get("track_id") or data.get("trackId") or "")
     if not track_id:
         return "ignored"
@@ -1300,10 +1403,9 @@ async def process_payment_update(data: dict) -> str:
     if payment.get("kind") == "invoice":
         if status != "paid":
             return "waiting"
-        await deliver_payment(payment, track_id)
+        await credit_user_wallet(payment, track_id)
         return "delivered"
 
-    # Static address: any amount can arrive, so verify the confirmed USD value.
     txs = extract_static_txs(data)
     if not txs:
         if status == "paid":
@@ -1341,18 +1443,17 @@ async def process_payment_update(data: dict) -> str:
             updated["user_id"],
             text=(
                 f"⚠️ <b>Partial payment received</b>: ${total:.2f} of ${expected:.2f}.\n"
-                f"Please send the remaining <b>${expected - total:.2f}</b> to the same address to complete your order."
+                f"Please send the remaining <b>${expected - total:.2f}</b> to the same address to top up your balance."
             ),
             parse_mode=ParseMode.HTML,
         )
         return "partial"
 
-    await deliver_payment(updated, track_id)
+    await credit_user_wallet(updated, track_id)
     return "delivered"
 
 
 async def handle_oxapay_webhook(request):
-    """Receives OxaPay webhooks (needs a Heroku *web* dyno)."""
     try:
         raw_body = await request.read()
         if not verify_oxapay_hmac(raw_body, request.headers.get("HMAC")):
@@ -1369,7 +1470,6 @@ async def handle_oxapay_webhook(request):
 
 
 async def payment_poller():
-    """Safety net: every 45s re-checks pending payments directly with OxaPay, so delivery works even if a webhook is lost."""
     while True:
         try:
             await asyncio.sleep(45)
@@ -1410,7 +1510,7 @@ async def main():
     app.router.add_get("/", lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT") or getattr(config, "WEBHOOK_PORT", 8080))  # Heroku injects $PORT
+    port = int(os.environ.get("PORT") or getattr(config, "WEBHOOK_PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 

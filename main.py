@@ -1,6 +1,5 @@
 """
-Digital product store bot — Aiogram 3.x + MongoDB (Motor) + Crypto API Payments + Gemini AI Parser.
-Includes complete inventory deletion (Single & Bulk Delete) + Data Usage Tracking + Dynamic Banner Images + Quantity Selection + AI Parser.
+Digital product store bot — Aiogram 3.x + MongoDB (Motor) + OxaPay Auto Payments + Gemini AI Metadata Parser.
 """
 from __future__ import annotations
 
@@ -10,7 +9,6 @@ import hashlib
 import html
 import json
 import logging
-import re
 import secrets
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -34,6 +32,7 @@ from aiogram.types import (
     Message,
 )
 from aiogram.utils.formatting import Bold, CustomEmoji, Text
+from aiohttp import web
 from cryptography.fernet import Fernet, InvalidToken
 from google import genai
 from google.genai import types
@@ -54,10 +53,9 @@ bot_ref: Optional[Bot] = None
 NEW_GV_PRICE_CENTS = 400  # $4.00
 OLD_GV_PRICE_CENTS = 600  # $6.00
 
-# Image Banners
+# Banners
 IMG_WELCOME = "https://i.ibb.co/3mMm5pk8/file-00000000304481fabc208d5a014f5b11.png"
 IMG_BUY_GV = "https://i.ibb.co/qFBDtRMT/file-00000000543c821195d09ed80ad42f1c.png"
-IMG_WALLET = "https://i.ibb.co/xKhG0g3D/file-00000000b8b48211b02df47384536e56.png"
 IMG_ORDERS = "https://i.ibb.co/Z6NpMbWG/file-0000000056e081fa90ef2c05289f9691.png"
 IMG_SUPPORT = "https://i.ibb.co/Bxy6JP8/file-0000000024bc8210a4acf5976393bad9.png"
 IMG_TERMS = "https://i.ibb.co/Q3R5YqjS/file-00000000910c8211957902711cb364f9.png"
@@ -70,20 +68,19 @@ if getattr(config, "GEMINI_API_KEY", None) and config.GEMINI_API_KEY != "YOUR_GE
     gemini_client = genai.Client(api_key=config.GEMINI_API_KEY)
 
 
-async def parse_gv_lines_with_gemini(text: str) -> list[dict[str, str]]:
-    """Uses Gemini AI to intelligently parse raw account dumps into structured data."""
+async def parse_gv_lines_with_gemini(text: str) -> list[dict[str, Any]]:
+    """Uses Gemini AI to parse raw GV dumps into detailed structured records."""
     if not gemini_client or not text.strip():
         return parse_gv_lines_fallback(text)
 
     prompt = (
         "Extract Google Voice / Google Account details from the provided raw text.\n"
-        "Analyze each line or block of text and return a JSON list of objects containing these exact keys:\n"
+        "Analyze each account block/line and return a JSON list of objects. Each object MUST contain:\n"
         "- email: primary google email\n"
         "- password: primary email password\n"
-        "- rec_email: recovery email (if available, else 'N/A')\n"
-        "- rec_pass: recovery email password or 2FA code (if available, else 'N/A')\n"
-        "- phone: phone number (if available, else 'N/A')\n"
-        "- raw_formatted: clean single-line or multi-line string combining these values nicely.\n\n"
+        "- rec_email: recovery email (or 'N/A')\n"
+        "- rec_pass_2fa: recovery password or 2FA key (or 'N/A')\n"
+        "- phone: phone number attached (or 'N/A')\n\n"
         "Raw text to parse:\n" + text
     )
 
@@ -101,35 +98,86 @@ async def parse_gv_lines_with_gemini(text: str) -> list[dict[str, str]]:
         if isinstance(data, list):
             parsed_accounts = []
             for item in data:
-                raw_fmt = item.get("raw_formatted")
-                if not raw_fmt:
-                    parts = [
-                        f"Email: {item.get('email', 'N/A')}",
-                        f"Password: {item.get('password', 'N/A')}",
-                        f"Recovery Email: {item.get('rec_email', 'N/A')}",
-                        f"Recovery Pass/2FA: {item.get('rec_pass', 'N/A')}",
-                        f"Phone: {item.get('phone', 'N/A')}"
-                    ]
-                    raw_fmt = "\n".join([p for p in parts if "N/A" not in p])
-                parsed_accounts.append({"raw_text": raw_fmt, "details": item})
+                parsed_accounts.append({
+                    "email": item.get("email", "N/A"),
+                    "password": item.get("password", "N/A"),
+                    "rec_email": item.get("rec_email", "N/A"),
+                    "rec_pass_2fa": item.get("rec_pass_2fa", "N/A"),
+                    "phone": item.get("phone", "N/A")
+                })
             return parsed_accounts
     except Exception as e:
-        log.error("Gemini AI Parsing failed, falling back to regex: %s", e)
+        log.error("Gemini AI Parsing failed, falling back: %s", e)
 
     return parse_gv_lines_fallback(text)
 
 
-def parse_gv_lines_fallback(text: str) -> list[dict[str, str]]:
-    """Fallback manual parser if Gemini API key is missing or encounters an error."""
+def parse_gv_lines_fallback(text: str) -> list[dict[str, Any]]:
+    """Fallback manual line parser."""
     accounts = []
-    text_clean = text.strip()
-    if not text_clean:
-        return accounts
-
-    lines = [line.strip() for line in text_clean.splitlines() if line.strip()]
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
     for line in lines:
-        accounts.append({"raw_text": line})
+        parts = line.split()
+        email = parts[0] if len(parts) > 0 else "N/A"
+        password = parts[1] if len(parts) > 1 else "N/A"
+        rec_email = parts[2] if len(parts) > 2 else "N/A"
+        phone = parts[-1] if len(parts) > 3 else "N/A"
+        accounts.append({
+            "email": email,
+            "password": password,
+            "rec_email": rec_email,
+            "rec_pass_2fa": "N/A",
+            "phone": phone
+        })
     return accounts
+
+
+# ════════════════════════════ OXAPAY API INTEGRATION ════════════════════════════
+
+
+async def create_oxapay_static_address(user_id: int, currency: str, amount_usd: float) -> Optional[dict]:
+    """Generates an automatic white-label payment address for a specific currency."""
+    payload = {
+        "merchant": config.OXAPAY_MERCHANT_KEY,
+        "currency": currency.upper(),
+        "amount": amount_usd,
+        "lifeTime": 60,  # Valid for 60 minutes
+        "feePaidByPayer": 0,
+        "callbackUrl": f"{config.WEBHOOK_URL}/oxapay/callback",
+        "description": f"Order payment for User {user_id}"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(config.OXAPAY_WHITE_LABEL_URL, json=payload, timeout=10) as resp:
+                data = await resp.json()
+                if data.get("result") == 100:
+                    return data
+    except Exception as e:
+        log.error("OxaPay API Error (White Label): %s", e)
+    return None
+
+
+async def create_oxapay_full_invoice(user_id: int, amount_usd: float) -> Optional[str]:
+    """Generates a full OxaPay Hosted Checkout Panel link where users can choose any crypto."""
+    payload = {
+        "merchant": config.OXAPAY_MERCHANT_KEY,
+        "amount": amount_usd,
+        "currency": "USD",
+        "lifeTime": 60,
+        "callbackUrl": f"{config.WEBHOOK_URL}/oxapay/callback",
+        "description": f"Multi-currency checkout for User {user_id}"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(config.OXAPAY_CREATE_INVOICE_URL, json=payload, timeout=10) as resp:
+                data = await resp.json()
+                if data.get("result") == 100:
+                    return data.get("payLink")
+    except Exception as e:
+        log.error("OxaPay API Error (Invoice): %s", e)
+    return None
 
 
 # ════════════════════════════ HELPERS ════════════════════════════
@@ -203,24 +251,6 @@ def dec(s: str) -> str:
         return ""
 
 
-async def fetch_crypto_price(coin_id: str) -> Optional[float]:
-    try:
-        async with aiohttp.ClientSession() as session:
-            params = {"ids": coin_id, "vs_currencies": "usd"}
-            async with session.get(config.PRICE_API_URL, params=params, timeout=5) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get(coin_id, {}).get("usd")
-    except Exception as e:
-        log.error("Error fetching crypto price: %s", e)
-    return None
-
-
-async def get_active_wallets() -> dict:
-    wallets = await get_setting("wallets", config.WALLETS)
-    return wallets
-
-
 # ════════════════════════════ KEYBOARDS & STYLING ════════════════════════════
 
 
@@ -262,7 +292,7 @@ def pager(prefix: str, page: int, pages: int) -> list:
 def main_menu(admin: bool) -> InlineKeyboardMarkup:
     rows = [
         [btn("🛍 Buy Google Voice", "pl:0", "success")],
-        [btn("💰 Wallet", "w", "success"), btn("📦 My Orders", "ol:0", "primary")],
+        [btn("📦 My Orders", "ol:0", "primary")],
         [btn("💬 Contact Support", "sup", "success"), btn("📜 Terms", "terms", "primary")],
     ]
     if admin:
@@ -341,15 +371,7 @@ async def init_db():
     await db.inventory.create_index([("status", A), ("gv_type", A)])
     await db.orders.create_index("order_id", unique=True)
     await db.orders.create_index([("user_id", A), ("created_at", D)])
-    await db.payments.create_index("payment_id", unique=True)
-
-    try:
-        await db.payments.drop_index("merchant_trade_no_1")
-    except Exception:
-        pass
-
-    await db.wallets.create_index("user_id", unique=True)
-    await db.wallet_transactions.create_index([("user_id", A), ("created_at", D)])
+    await db.payments.create_index("track_id", unique=True)
     await db.settings.create_index("key", unique=True)
 
 
@@ -362,37 +384,27 @@ async def set_setting(key: str, value: Any):
     await db.settings.update_one({"key": key}, {"$set": {"value": value, "updated_at": now()}}, upsert=True)
 
 
-async def get_balance(user_id: int) -> int:
-    w = await db.wallets.find_one({"user_id": user_id})
-    return w["balance_cents"] if w else 0
+# ═══════════════════════════ INVENTORY & FULFILLMENT ═══════════════════════════
 
 
-# ═══════════════════════════ INVENTORY & PURCHASES ═══════════════════════════
-
-
-async def bulk_purchase(user_id: int, gv_type: str, qty: int, user_info: str):
+async def fulfill_order(user_id: int, gv_type: str, qty: int, track_id: str) -> tuple[Optional[dict], Optional[list], Optional[str]]:
+    """Fulfills order after automatic payment confirmation by fetching requested stock items without deleting remaining inventory."""
     unit_price = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
     total_cents = unit_price * qty
     gv_title = "New GV" if gv_type == "new" else "Old GV"
     t = now()
 
+    # Fetch ONLY requested quantity
     available_items = await db.inventory.find(
         {"gv_type": gv_type, "status": "available"}
     ).limit(qty).to_list(qty)
 
     if len(available_items) < qty:
-        return None, None, f"Insufficient stock available. Only {len(available_items)} available."
+        return None, None, f"Insufficient stock. Available: {len(available_items)}"
 
     item_ids = [item["item_id"] for item in available_items]
 
-    w = await db.wallets.find_one_and_update(
-        {"user_id": user_id, "balance_cents": {"$gte": total_cents}},
-        {"$inc": {"balance_cents": -total_cents}, "$set": {"updated_at": t}},
-        return_document=ReturnDocument.AFTER,
-    )
-    if not w:
-        return None, None, f"Insufficient balance. You need {money(total_cents)}."
-
+    # Mark ONLY selected items as sold
     oid = new_id("ORD", 5)
     await db.inventory.update_many(
         {"item_id": {"$in": item_ids}},
@@ -401,6 +413,7 @@ async def bulk_purchase(user_id: int, gv_type: str, qty: int, user_info: str):
 
     order = {
         "order_id": oid,
+        "track_id": track_id,
         "user_id": user_id,
         "product_name": f"{gv_title} x{qty}",
         "amount_cents": total_cents,
@@ -411,25 +424,12 @@ async def bulk_purchase(user_id: int, gv_type: str, qty: int, user_info: str):
     }
     await db.orders.insert_one(order)
 
-    await db.wallet_transactions.insert_one({
-        "tx_id": new_id("TX", 6),
-        "user_id": user_id,
-        "type": "purchase",
-        "amount_cents": -total_cents,
-        "ref_id": oid,
-        "note": f"Purchased {qty}x {gv_title}",
-        "applied": True,
-        "balance_after_cents": w["balance_cents"],
-        "created_at": t,
-    })
-
     admin_alert = Text(
-        CustomEmoji("🛍", custom_emoji_id=config.STORE_EMOJI_ID), " ", Bold("New Product Purchase!"), "\n\n",
+        CustomEmoji("🛍", custom_emoji_id=config.STORE_EMOJI_ID), " ", Bold("Auto-Payment Received & Fulfilled!"), "\n\n",
         f"<b>Order ID:</b> <code>{oid}</code>\n",
-        f"<b>Buyer:</b> {user_info} (ID: <code>{user_id}</code>)\n",
+        f"<b>Buyer ID:</b> <code>{user_id}</code>\n",
         f"<b>Product:</b> {gv_title} x{qty}\n",
-        f"<b>Price Paid:</b> {money(total_cents)}\n",
-        f"<b>Remaining User Balance:</b> {money(w['balance_cents'])}"
+        f"<b>Amount Paid:</b> {money(total_cents)}"
     )
     await notify_admins(content=admin_alert)
 
@@ -437,26 +437,26 @@ async def bulk_purchase(user_id: int, gv_type: str, qty: int, user_info: str):
 
 
 def delivery_block(item: dict) -> str:
-    raw_enc = item.get("raw_text_enc")
-    if raw_enc:
-        content = dec(raw_enc)
-    else:
-        dt = item.get("details", {})
-        if dt:
-            email = dec(dt.get("email_enc", ""))
-            password = dec(dt.get("pass_enc", ""))
-            rec_email = dec(dt.get("rec_enc", ""))
-            two_fa = dec(dt.get("two_fa_enc", ""))
-            phone_num = dec(dt.get("num_enc", ""))
-            lines = [email, password, rec_email]
-            if two_fa and two_fa != "N/A":
-                lines.append(two_fa)
-            lines.append(phone_num)
-            content = "\n".join([line for line in lines if line])
-        else:
-            content = dec(item.get("code_enc", ""))
+    """Formats full GV account metadata parsed by Gemini AI."""
+    dt = item.get("details", {})
+    if dt:
+        email = dec(dt.get("email_enc", ""))
+        password = dec(dt.get("pass_enc", ""))
+        rec_email = dec(dt.get("rec_enc", ""))
+        rec_pass_2fa = dec(dt.get("rec_pass_2fa_enc", ""))
+        phone = dec(dt.get("phone_enc", ""))
 
-    return f"<code>{esc(content)}</code>"
+        content = (
+            f"📧 <b>Gmail:</b> <code>{esc(email)}</code>\n"
+            f"🔑 <b>Password:</b> <code>{esc(password)}</code>\n"
+            f"📩 <b>Recovery Email:</b> <code>{esc(rec_email)}</code>\n"
+            f"🔐 <b>2FA / Recovery Pass:</b> <code>{esc(rec_pass_2fa)}</code>\n"
+            f"📱 <b>Phone:</b> <code>{esc(phone)}</code>"
+        )
+    else:
+        content = f"<code>{esc(dec(item.get('code_enc', '')))}</code>"
+
+    return content
 
 
 # ═══════════════════════ MIDDLEWARES & STATES ═══════════════════════
@@ -473,9 +473,6 @@ class UserMiddleware(BaseMiddleware):
              "$setOnInsert": {"created_at": now(), "banned": False}},
             upsert=True, return_document=ReturnDocument.AFTER,
         )
-        if not doc.get("wallet_ready"):
-            await db.wallets.update_one({"user_id": u.id}, {"$setOnInsert": {"balance_cents": 0, "created_at": now()}}, upsert=True)
-            await db.users.update_one({"user_id": u.id}, {"$set": {"wallet_ready": True}})
         data["db_user"] = doc
         return await handler(event, data)
 
@@ -486,20 +483,8 @@ class IsAdmin(BaseFilter):
         return bool(u and u.id in ADMIN_SET)
 
 
-class TopUpSt(StatesGroup):
-    amount = State()
-    currency = State()
-    txn_id = State()
-    proof_photo = State()
-
-
 class BuyGVSt(StatesGroup):
     custom_qty = State()
-
-
-class AdminWalletSt(StatesGroup):
-    currency_key = State()
-    address = State()
 
 
 class BulkAddStockSt(StatesGroup):
@@ -526,11 +511,9 @@ admin_router.callback_query.filter(IsAdmin())
 @user_router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
-    bal = await get_balance(m.from_user.id)
     welcome_text = (
         f"🎁 <b>Welcome to {config.STORE_NAME}</b>\n\n"
-        f"<b>Your Balance:</b> <b>{money(bal)}</b>\n\n"
-        "Select an option below to buy Google Voice accounts or manage your wallet balance."
+        "Select an option below to buy Google Voice accounts instantly via automatic Crypto payments."
     )
     await m.answer_photo(photo=IMG_WELCOME, caption=welcome_text, parse_mode=ParseMode.HTML, reply_markup=main_menu(m.from_user.id in ADMIN_SET))
 
@@ -539,11 +522,9 @@ async def cmd_start(m: Message, state: FSMContext):
 @user_router.callback_query(F.data == "cancel")
 async def cb_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    bal = await get_balance(c.from_user.id)
     welcome_text = (
         f"🎁 <b>Welcome to {config.STORE_NAME}</b>\n\n"
-        f"<b>Your Balance:</b> <b>{money(bal)}</b>\n\n"
-        "Select an option below to browse products or top up your balance."
+        "Select an option below to browse products or complete orders."
     )
     await show(c, welcome_text, main_menu(c.from_user.id in ADMIN_SET), photo_url=IMG_WELCOME)
 
@@ -576,19 +557,17 @@ async def cb_gv_select(c: CallbackQuery, state: FSMContext):
     gv_title = "New GV" if gv_type == "new" else "Old GV"
 
     available_count = await db.inventory.count_documents({"gv_type": gv_type, "status": "available"})
-    bal = await get_balance(c.from_user.id)
 
     text = (
         f"📦 <b>Category: {gv_title}</b>\n\n"
         f"Price per account: <b>{money(unit_cents)}</b>\n"
-        f"Available Stock: <b>{available_count}</b> accounts\n"
-        f"Your Balance: <b>{money(bal)}</b>\n\n"
-        "Select quantity using the buttons below or click <b>Custom Quantity</b> to type an amount:"
+        f"Available Stock: <b>{available_count}</b> accounts\n\n"
+        "Select quantity using the buttons below or click <b>Custom Quantity</b>:"
     )
 
     rows = [
-        [btn("1", f"gv_confirm:{gv_type}:1"), btn("2", f"gv_confirm:{gv_type}:2"), btn("5", f"gv_confirm:{gv_type}:5")],
-        [btn("10", f"gv_confirm:{gv_type}:10"), btn("15", f"gv_confirm:{gv_type}:15")],
+        [btn("1", f"gv_checkout:{gv_type}:1"), btn("2", f"gv_checkout:{gv_type}:2"), btn("5", f"gv_checkout:{gv_type}:5")],
+        [btn("10", f"gv_checkout:{gv_type}:10"), btn("15", f"gv_checkout:{gv_type}:15")],
         [btn("✏️ Custom Quantity", f"gv_custom:{gv_type}", "primary")],
         [back("pl:0")]
     ]
@@ -604,8 +583,8 @@ async def cb_gv_custom_prompt(c: CallbackQuery, state: FSMContext):
     gv_title = "New GV" if gv_type == "new" else "Old GV"
     await show(
         c,
-        f"✏️ <b>Enter Custom Quantity for {gv_title}:</b>\n\nPlease type the number of accounts you wish to purchase (e.g. <code>3</code> or <code>20</code>):",
-        kb([[cancel_btn(f"gv_select:{gv_type}")]]),
+        f"✏️ <b>Enter Custom Quantity for {gv_title}:</b>\n\nPlease type the number of accounts you wish to purchase:",
+        kb([[cancel_btn(f"gv_select:{gv_type}")] ]),
         photo_url=IMG_BUY_GV
     )
 
@@ -620,277 +599,124 @@ async def msg_gv_custom_qty(m: Message, state: FSMContext):
     gv_type = data.get("gv_type", "new")
     await state.clear()
 
-    await render_gv_checkout(m, m.from_user.id, gv_type, qty)
+    await render_gv_payment_options(m, m.from_user.id, gv_type, qty)
 
 
-@user_router.callback_query(F.data.startswith("gv_confirm:"))
-async def cb_gv_confirm_qty(c: CallbackQuery, state: FSMContext):
+@user_router.callback_query(F.data.startswith("gv_checkout:"))
+async def cb_gv_checkout(c: CallbackQuery, state: FSMContext):
     await state.clear()
     _, gv_type, qty_str = c.data.split(":")
     qty = to_int(qty_str)
-    await render_gv_checkout(c, c.from_user.id, gv_type, qty)
+    await render_gv_payment_options(c, c.from_user.id, gv_type, qty)
 
 
-async def render_gv_checkout(ev, user_id: int, gv_type: str, qty: int):
+# ── Automatic Payment Generation ──
+
+
+async def render_gv_payment_options(ev, user_id: int, gv_type: str, qty: int):
     unit_cents = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
     total_cents = unit_cents * qty
+    total_usd = total_cents / 100.0
     gv_title = "New GV" if gv_type == "new" else "Old GV"
-    bal = await get_balance(user_id)
 
     available_count = await db.inventory.count_documents({"gv_type": gv_type, "status": "available"})
+
+    if available_count < qty:
+        text = f"❌ <b>Not enough stock!</b> Required: <b>{qty}</b>, Available: <b>{available_count}</b>."
+        rows = [[back(f"gv_select:{gv_type}", "⬅️ Change Quantity")]]
+        return await show(ev, text, kb(rows), photo_url=IMG_BUY_GV)
 
     text = (
         f"🛍 <b>Order Summary: {gv_title}</b>\n\n"
         f"Quantity: <b>{qty}</b>\n"
-        f"Unit Price: <b>{money(unit_cents)}</b>\n"
-        f"Total Price: <b>{money(total_cents)}</b>\n\n"
-        f"Your Current Balance: <b>{money(bal)}</b>\n"
-        f"Available Stock: <b>{available_count}</b>\n\n"
+        f"Total Amount: <b>{money(total_cents)}</b>\n\n"
+        "⚡ <b>Select Automatic Payment Currency:</b>\n"
+        "Click a top coin below to get an automatic payment address or select <b>Pay with Other Currency</b>:"
     )
 
     rows = []
-    if available_count < qty:
-        text += f"❌ <b>Not enough stock available!</b> Maximum available is {available_count}."
-        rows.append([back(f"gv_select:{gv_type}", "⬅️ Change Quantity")])
-    elif bal < total_cents:
-        shortfall = total_cents - bal
-        text += f"⚠️ <b>Insufficient Balance!</b> You need <b>{money(shortfall)}</b> more."
-        rows.append([btn("➕ Top Up Balance", "w", "success")])
-        rows.append([back(f"gv_select:{gv_type}", "⬅️ Change Quantity")])
-    else:
-        text += "<i>Click below to confirm payment and receive your account credentials instantly.</i>"
-        rows.append([btn(f"💳 Pay {money(total_cents)}", f"buygv_exec:{gv_type}:{qty}", "success")])
-        rows.append([back(f"gv_select:{gv_type}", "⬅️ Change Quantity")])
+    # Display Top 10 Currencies in rows of 2
+    top_coins = config.TOP_10_CURRENCIES
+    for i in range(0, len(top_coins), 2):
+        pair = top_coins[i:i+2]
+        row_btns = [btn(f"Pay in {coin}", f"pay_auto:{gv_type}:{qty}:{coin}", "primary") for coin in pair]
+        rows.append(row_btns)
+
+    # Multi-Currency Panel Option
+    rows.append([btn("🌐 Pay with Other Currency (Full Panel)", f"pay_panel:{gv_type}:{qty}", "success")])
+    rows.append([back(f"gv_select:{gv_type}", "⬅️ Back")])
 
     await show(ev, text, kb(rows), photo_url=IMG_BUY_GV)
 
 
-@user_router.callback_query(F.data.startswith("buygv_exec:"))
-async def cb_buy_gv_exec(c: CallbackQuery):
-    _, gv_type, qty_str = c.data.split(":")
+@user_router.callback_query(F.data.startswith("pay_auto:"))
+async def cb_pay_auto(c: CallbackQuery):
+    _, gv_type, qty_str, currency = c.data.split(":")
     qty = to_int(qty_str)
-    await c.answer("Processing your order...")
+    unit_cents = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
+    total_usd = (unit_cents * qty) / 100.0
 
-    u_info = f"@{c.from_user.username}" if c.from_user.username else c.from_user.first_name
-    order, items, err = await bulk_purchase(c.from_user.id, gv_type, qty, u_info)
+    await c.answer("Generating OxaPay address...")
+    resp = await create_oxapay_static_address(c.from_user.id, currency, total_usd)
 
-    if err:
-        return await show(c, f"❌ {err}", kb([[back("pl:0")]]), photo_url=IMG_BUY_GV)
+    if not resp or not resp.get("address"):
+        return await alert(c, "Failed to generate payment address. Please try another currency.")
 
-    accounts_str = "\n\n".join([f"<b>Account #{idx}:</b>\n{delivery_block(item)}" for idx, item in enumerate(items, 1)])
+    addr = resp["address"]
+    crypto_amount = resp.get("payAmount", "N/A")
+    track_id = resp.get("trackId")
 
-    text = (
-        f"✅ <b>Order Placed Successfully!</b>\n\n"
-        f"<b>Order ID:</b> <code>{order['order_id']}</code>\n"
-        f"<b>Product:</b> {order['product_name']}\n"
-        f"<b>Total Paid:</b> {money(order['amount_cents'])}\n\n"
-        f"🔑 <b>Delivered Account Details:</b>\n\n"
-        f"{accounts_str}"
+    # Store pending transaction for Webhook Auto Verification
+    await db.payments.update_one(
+        {"track_id": track_id},
+        {"$set": {
+            "track_id": track_id,
+            "user_id": c.from_user.id,
+            "gv_type": gv_type,
+            "quantity": qty,
+            "amount_cents": unit_cents * qty,
+            "currency": currency,
+            "status": "pending",
+            "created_at": now()
+        }},
+        upsert=True
     )
 
-    rows = [[btn("📦 My Orders", "ol:0", "primary"), back("home", "🏠 Back to Menu")]]
+    text = (
+        f"⚡ <b>Automatic OxaPay Payment</b>\n\n"
+        f"Send exactly: <code>{crypto_amount}</code> <b>{currency.upper()}</b>\n"
+        f"To Address:\n<code>{addr}</code>\n\n"
+        f"⌛ <i>This address expires in 60 minutes. Once payment is confirmed on the blockchain, your accounts will be delivered instantly!</i>"
+    )
+
+    rows = [[back("home", "🏠 Return to Main Menu")]]
     await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
 
-# ── Top-Up Wallet Workflow ──
+@user_router.callback_query(F.data.startswith("pay_panel:"))
+async def cb_pay_panel(c: CallbackQuery):
+    _, gv_type, qty_str = c.data.split(":")
+    qty = to_int(qty_str)
+    unit_cents = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
+    total_usd = (unit_cents * qty) / 100.0
 
+    await c.answer("Creating payment invoice...")
+    pay_link = await create_oxapay_full_invoice(c.from_user.id, total_usd)
 
-@user_router.callback_query(F.data == "w")
-async def cb_wallet(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    bal = await get_balance(c.from_user.id)
-    text = f"👛 <b>Wallet Management</b>\n\n<b>Current Balance: {money(bal)}</b>"
-    await show(c, text, kb([
-        [btn("➕ Top Up Balance", "tu_start", "success"), btn("📜 Transactions", "wt:0", "primary")],
-        [back()],
-    ]), photo_url=IMG_WALLET)
-
-
-@user_router.callback_query(F.data == "tu_start")
-async def cb_topup_start(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await state.set_state(TopUpSt.amount)
-    await show(
-        c,
-        f"💵 <b>Enter Deposit Amount (in USD)</b>\n\nExample: Type <code>10</code> or <code>10.00</code>:\nMinimum Deposit: <b>${config.MIN_DEPOSIT}</b>",
-        kb([[cancel_btn("w")]]),
-        photo_url=IMG_WALLET
-    )
-
-
-@user_router.message(TopUpSt.amount, F.text)
-async def msg_topup_amount(m: Message, state: FSMContext):
-    cents = parse_money(m.text)
-    min_cents = int(Decimal(config.MIN_DEPOSIT) * 100)
-    if cents is None or cents < min_cents:
-        return await m.answer(f"❌ Invalid amount. Minimum deposit is ${config.MIN_DEPOSIT}.", reply_markup=kb([[cancel_btn("w")]]))
-
-    await state.update_data(amount_cents=cents)
-    await state.set_state(TopUpSt.currency)
-
-    wallets = await get_active_wallets()
-    rows = []
-
-    for key, addr in wallets.items():
-        if addr and addr.strip():
-            rows.append([btn(f"Pay with {key}", f"tu_curr:{key}", "primary")])
-
-    if not rows:
-        return await m.answer("❌ No wallet addresses available. Please contact support.", reply_markup=kb([[back("w")]]))
-
-    rows.append([cancel_btn("w")])
-    await m.answer(f"💳 You chose <b>{money(cents)}</b>.\n\nSelect payment method:", reply_markup=kb(rows))
-
-
-@user_router.callback_query(TopUpSt.currency, F.data.startswith("tu_curr:"))
-async def cb_topup_currency(c: CallbackQuery, state: FSMContext):
-    curr = c.data.split(":")[1]
-    data = await state.get_data()
-    cents = data["amount_cents"]
-    usd_val = cents / 100.0
-
-    wallets = await get_active_wallets()
-    wallet_addr = wallets.get(curr)
-
-    if not wallet_addr:
-        return await alert(c, "Selected currency unavailable.")
-
-    coin_id = config.CURRENCY_PRICE_IDS.get(curr, "bitcoin")
-    price = await fetch_crypto_price(coin_id)
-
-    if price and price > 0:
-        crypto_amount = round(usd_val / price, 6)
-        formatted_crypto = f"{crypto_amount:.6f} {curr.split('_')[0]}"
-    else:
-        formatted_crypto = f"Calculate equivalent for {money(cents)}"
-
-    await state.update_data(currency=curr, crypto_amount=formatted_crypto, wallet_addr=wallet_addr)
-    await state.set_state(TopUpSt.txn_id)
+    if not pay_link:
+        return await alert(c, "Failed to connect to OxaPay. Please try again.")
 
     text = (
-        f"🧾 <b>Payment Invoice Created</b>\n\n"
-        f"<b>Amount Owed:</b> <code>{formatted_crypto}</code> (${usd_val:.2f} USD)\n\n"
-        f"<b>Send Payment to Address:</b>\n<code>{wallet_addr}</code>\n\n"
-        f"<i>Send the exact amount above. After sending, click 'I Have Paid' below.</i>"
+        f"🌐 <b>OxaPay Multi-Currency Checkout</b>\n\n"
+        f"Amount: <b>${total_usd:.2f} USD</b>\n\n"
+        "Click the button below to open the payment page and choose from 30+ supported cryptocurrencies:"
     )
 
     rows = [
-        [btn("✅ I Have Paid", "tu_paid", "success")],
-        [cancel_btn("w")]
+        [btn("💳 Open OxaPay Payment Gateway", url=pay_link, style="success")],
+        [back("home", "🏠 Main Menu")]
     ]
-    await show(c, text, kb(rows), photo_url=IMG_WALLET)
-
-
-@user_router.callback_query(TopUpSt.txn_id, F.data == "tu_paid")
-async def cb_topup_paid(c: CallbackQuery):
-    await show(c, "✏️ Please type or paste your <b>Transaction Hash / TXN ID</b>:", kb([[cancel_btn("w")]]), photo_url=IMG_WALLET)
-
-
-@user_router.message(TopUpSt.txn_id, F.text)
-async def msg_topup_txnid(m: Message, state: FSMContext):
-    await state.update_data(txn_id=m.text.strip())
-    await state.set_state(TopUpSt.proof_photo)
-
-    await m.answer(
-        "📸 Please send a <b>screenshot / photo proof</b> of your completed transaction:",
-        reply_markup=kb([[cancel_btn("w")]])
-    )
-
-
-@user_router.message(TopUpSt.proof_photo, F.photo | F.document)
-async def msg_topup_proof(m: Message, state: FSMContext):
-    photo_id = None
-    if m.photo:
-        photo_id = m.photo[-1].file_id
-    elif m.document and m.document.mime_type and m.document.mime_type.startswith("image/"):
-        photo_id = m.document.file_id
-
-    if not photo_id:
-        return await m.answer(
-            "❌ Invalid format. Please send an image/screenshot as proof.",
-            reply_markup=kb([[cancel_btn("w")]])
-        )
-
-    data = await state.get_data()
-    await state.clear()
-
-    pid = new_id("DEP", 6)
-    cents = data["amount_cents"]
-    curr = data["currency"]
-    crypto_amt = data.get("crypto_amount", "N/A")
-    txid = data["txn_id"]
-    u_info = f"@{m.from_user.username}" if m.from_user.username else m.from_user.first_name
-
-    deposit_doc = {
-        "payment_id": pid,
-        "merchant_trade_no": pid,
-        "user_id": m.from_user.id,
-        "user_info": u_info,
-        "amount_cents": cents,
-        "currency": curr,
-        "crypto_amount": crypto_amt,
-        "txn_id": txid,
-        "photo_id": photo_id,
-        "status": "pending",
-        "created_at": now(),
-    }
-    await db.payments.insert_one(deposit_doc)
-
-    support_username = getattr(config, "SUPPORT_USERNAME", "").lstrip("@")
-    support_ref = f"@{support_username}" if support_username else "support"
-
-    await m.answer(
-        "✅ <b>Payment Proof Submitted!</b>\n\n"
-        "⏳ <b>Payment should be processed in 5 to 20 minutes.</b>\n"
-        f"If not, send a message to support ID: {support_ref} or contact support.",
-        reply_markup=kb([[back("w")]])
-    )
-
-    admin_markup = kb([
-        [
-            btn("✅ Approve", f"adm:app_dep:{pid}", "success"),
-            btn("❌ Reject", f"adm:rej_dep:{pid}", "danger")
-        ]
-    ])
-
-    admin_text = (
-        f"💳 <b>New Deposit Verification Request!</b>\n\n"
-        f"<b>ID:</b> <code>{pid}</code>\n"
-        f"<b>User:</b> {u_info} (ID: <code>{m.from_user.id}</code>)\n"
-        f"<b>USD Amount:</b> {money(cents)}\n"
-        f"<b>Expected Crypto:</b> {crypto_amt}\n"
-        f"<b>Currency:</b> {curr}\n"
-        f"<b>TXN ID:</b> <code>{esc(txid)}</code>"
-    )
-
-    for aid in ADMIN_SET:
-        try:
-            if m.photo:
-                await bot_ref.send_photo(aid, photo=photo_id, caption=admin_text, reply_markup=admin_markup, parse_mode=ParseMode.HTML)
-            else:
-                await bot_ref.send_document(aid, document=photo_id, caption=admin_text, reply_markup=admin_markup, parse_mode=ParseMode.HTML)
-        except TelegramAPIError as e:
-            log.warning("Failed sending payment proof to admin %s: %s", aid, e)
-
-
-@user_router.message(TopUpSt.proof_photo)
-async def msg_topup_proof_invalid(m: Message):
-    await m.answer(
-        "⚠ Please upload a valid image screenshot of your payment proof.",
-        reply_markup=kb([[cancel_btn("w")]])
-    )
-
-
-@user_router.callback_query(F.data.startswith("wt:"))
-async def cb_transactions(c: CallbackQuery):
-    page = to_int(c.data.split(":")[1])
-    docs, page, pages, total = await page_query(db.wallet_transactions, {"user_id": c.from_user.id}, [("created_at", -1)], page, size=PAGE_10)
-    if not total:
-        text = "📜 <b>Transaction History</b>\n\nNo records found."
-    else:
-        lines = [f"{'+' if t['amount_cents'] >= 0 else '−'}{money(abs(t['amount_cents']))} · {esc(t['type'].title())} · {fmt_dt(t['created_at'])}" for t in docs]
-        text = "📜 <b>Transaction History</b>\n\n" + "\n".join(lines)
-    await show(c, text, kb(pager("wt", page, pages) + [[back("w")]]), photo_url=IMG_WALLET)
+    await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
 
 # ── Orders & Support ──
@@ -919,18 +745,14 @@ async def cb_order_view(c: CallbackQuery):
     text = (
         f"<b>Order ID: {o['order_id']}</b>\n"
         f"<b>Product: {o['product_name']}</b>\n"
-        f"<b>Amount Deducted: {money(o['amount_cents'])}</b>\n\n"
-        f"<b>Delivered Account Details:</b>\n\n"
+        f"<b>Amount Paid: {money(o['amount_cents'])}</b>\n\n"
+        f"🔑 <b>Delivered Account Details:</b>\n\n"
     )
 
     if o.get("item_ids"):
         items = await db.inventory.find({"item_id": {"$in": o["item_ids"]}}).to_list(len(o["item_ids"]))
         for idx, item in enumerate(items, 1):
             text += f"<b>Account #{idx}:</b>\n{delivery_block(item)}\n\n"
-    elif o.get("item_id"):
-        item = await db.inventory.find_one({"item_id": o["item_id"]})
-        if item:
-            text += delivery_block(item)
 
     await show(c, text, kb([[back("ol:0")]]), photo_url=IMG_ORDERS)
 
@@ -974,7 +796,6 @@ def admin_menu() -> InlineKeyboardMarkup:
     return kb([
         [btn("➕ Add Stock", "adm:add_choice", "success"), btn("📦 Active Stock", "adm:ai:0", "primary")],
         [btn("🔥 Delete All Stock", "adm:del_all_confirm", "danger"), btn("🛒 Sold Stock", "adm:ss:0", "primary")],
-        [btn("💳 Pending Deposits", "adm:pd:0", "primary"), btn("⚙ Manage Wallets", "adm:wallets", "primary")],
         [btn("📊 Statistics & Data Usage", "adm:st", "primary")],
         [btn("📝 Terms", "adm:tm", "primary")],
         [back("home", "🏠 User Menu")],
@@ -991,141 +812,6 @@ async def cmd_admin(m: Message, state: FSMContext):
 async def cb_admin_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await show(c, "⚙️ <b>Admin Control Panel</b>", admin_menu())
-
-
-# ── Admin Dynamic Wallet Management ──
-
-
-@admin_router.callback_query(F.data == "adm:wallets")
-async def cb_admin_wallets(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    wallets = await get_active_wallets()
-    lines = ["⚙ <b>Wallet Addresses Management</b>\n"]
-    rows = []
-
-    for key, addr in wallets.items():
-        lines.append(f"• <b>{key}:</b>\n<code>{addr}</code>\n")
-        rows.append([btn(f"Edit {key}", f"adm:ewallet:{key}", "primary")])
-
-    rows.append([back("adm:home")])
-    await show(c, "\n".join(lines), kb(rows))
-
-
-@admin_router.callback_query(F.data.startswith("adm:ewallet:"))
-async def cb_admin_edit_wallet(c: CallbackQuery, state: FSMContext):
-    key = c.data.split(":")[2]
-    await state.update_data(currency_key=key)
-    await state.set_state(AdminWalletSt.address)
-    await show(c, f"✏️ Send new address for <b>{key}</b>:", kb([[cancel_btn("adm:wallets")]]))
-
-
-@admin_router.message(AdminWalletSt.address, F.text)
-async def msg_admin_wallet_save(m: Message, state: FSMContext):
-    data = await state.get_data()
-    key = data["currency_key"]
-    new_addr = m.text.strip()
-    await state.clear()
-
-    wallets = await get_active_wallets()
-    wallets[key] = new_addr
-    await set_setting("wallets", wallets)
-
-    await m.answer(f"✅ Wallet for <b>{key}</b> updated successfully!\n\nNew Address:\n<code>{new_addr}</code>", reply_markup=kb([[back("adm:wallets")]]))
-
-
-# ── Deposit Approvals ──
-
-
-@admin_router.callback_query(F.data.startswith("adm:app_dep:"))
-async def cb_approve_deposit(c: CallbackQuery):
-    pid = c.data.split(":")[2]
-    pay = await db.payments.find_one_and_update(
-        {"payment_id": pid, "status": "pending"},
-        {"$set": {"status": "completed", "approved_at": now()}},
-        return_document=ReturnDocument.AFTER,
-    )
-    if not pay:
-        return await alert(c, "Deposit already processed or expired.")
-
-    w = await db.wallets.find_one_and_update(
-        {"user_id": pay["user_id"]},
-        {"$inc": {"balance_cents": pay["amount_cents"]}, "$set": {"updated_at": now()}},
-        upsert=True, return_document=ReturnDocument.AFTER,
-    )
-
-    await db.wallet_transactions.insert_one({
-        "tx_id": new_id("TX", 6),
-        "user_id": pay["user_id"],
-        "type": "deposit",
-        "amount_cents": pay["amount_cents"],
-        "ref_id": pid,
-        "note": f"Manual {pay['currency']} Deposit",
-        "applied": True,
-        "balance_after_cents": w["balance_cents"],
-        "created_at": now(),
-    })
-
-    text = f"💰 <b>Deposit Approved!</b>\n\n<b>{money(pay['amount_cents'])}</b> added to your wallet.\nNew Balance: <b>{money(w['balance_cents'])}</b>"
-    await safe_send(pay["user_id"], text=text, parse_mode=ParseMode.HTML)
-
-    await show(c, f"✅ Deposit <code>{pid}</code> approved and credited successfully!", kb([[back("adm:home")]]))
-
-
-@admin_router.callback_query(F.data.startswith("adm:rej_dep:"))
-async def cb_reject_deposit(c: CallbackQuery):
-    pid = c.data.split(":")[2]
-    pay = await db.payments.find_one_and_update(
-        {"payment_id": pid, "status": "pending"},
-        {"$set": {"status": "rejected", "rejected_at": now()}},
-        return_document=ReturnDocument.AFTER,
-    )
-    if not pay:
-        return await alert(c, "Deposit already processed.")
-
-    await safe_send(pay["user_id"], text=f"❌ Deposit <code>{pid}</code> was rejected by admin.")
-    await show(c, f"❌ Deposit <code>{pid}</code> rejected.", kb([[back("adm:home")]]))
-
-
-@admin_router.callback_query(F.data.startswith("adm:pd:"))
-async def cb_pending_deposits(c: CallbackQuery):
-    page = to_int(c.data.split(":")[2])
-    docs, page, pages, total = await page_query(db.payments, {"status": "pending"}, [("created_at", -1)], page, size=PAGE_10)
-
-    if not total:
-        return await show(c, "💳 <b>Pending Deposits</b>\n\nNo pending top-up requests.", kb([[back("adm:home")]]))
-
-    rows = []
-    for p in docs:
-        rows.append([btn(f"{p['payment_id']} · {money(p['amount_cents'])} ({p['currency']})", f"adm:vdep:{p['payment_id']}", "primary")])
-
-    rows += pager("adm:pd", page, pages)
-    rows.append([back("adm:home")])
-    await show(c, f"💳 <b>Pending Deposit Requests</b> ({total}):", kb(rows))
-
-
-@admin_router.callback_query(F.data.startswith("adm:vdep:"))
-async def cb_view_deposit(c: CallbackQuery):
-    pid = c.data.split(":")[2]
-    p = await db.payments.find_one({"payment_id": pid})
-    if not p:
-        return await alert(c, "Deposit not found.")
-
-    text = (
-        f"💳 <b>Deposit Request:</b> <code>{p['payment_id']}</code>\n\n"
-        f"User: {p.get('user_info')} (ID: <code>{p['user_id']}</code>)\n"
-        f"USD Amount: <b>{money(p['amount_cents'])}</b>\n"
-        f"Currency: {p['currency']}\n"
-        f"Expected Crypto: {p.get('crypto_amount', 'N/A')}\n"
-        f"TXN ID: <code>{esc(p['txn_id'])}</code>\n"
-        f"Status: {p['status']}"
-    )
-
-    rows = []
-    if p["status"] == "pending":
-        rows.append([btn("✅ Approve", f"adm:app_dep:{pid}", "success"), btn("❌ Reject", f"adm:rej_dep:{pid}", "danger")])
-    rows.append([back("adm:pd:0")])
-
-    await show(c, text, kb(rows))
 
 
 # ── Stock Management (Integrated with Gemini AI Parser) ──
@@ -1149,10 +835,9 @@ async def cb_bulk_add_stock_start(c: CallbackQuery, state: FSMContext):
     await state.set_state(BulkAddStockSt.raw_data)
 
     prompt = (
-        "➕ <b>Add stock (Gemini AI Enabled)</b>\n\n"
-        "<b>Send or paste raw account text:</b>\n"
-        "Paste account credentials in any raw format. Gemini AI will analyze, format, and structure each line.\n\n"
-        "<i>Send /cancel to abort.</i>"
+        "➕ <b>Add Bulk Stock (Gemini AI Enabled)</b>\n\n"
+        "<b>Send or paste bulk account dump:</b>\n"
+        "Gemini AI will parse, structure, and format each account with Gmail, Password, Recovery Email, 2FA, and Phone Number separately."
     )
     await show(c, prompt, kb([[cancel_btn("adm:home")]]))
 
@@ -1167,26 +852,23 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
     gv_type = data.get("gv_type", "new")
     price_cents = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
 
-    processing_msg = await m.answer("🧠 <i>Gemini AI is parsing and structuring account data...</i>", parse_mode=ParseMode.HTML)
+    processing_msg = await m.answer("🧠 <i>Gemini AI is parsing Gmail, Recovery Email, 2FA & Phone Numbers...</i>", parse_mode=ParseMode.HTML)
 
     parsed_items = await parse_gv_lines_with_gemini(m.text)
     if not parsed_items:
         await processing_msg.delete()
-        return await m.answer("❌ Invalid format or empty text. Please check input.", reply_markup=kb([[cancel_btn("adm:home")]]))
+        return await m.answer("❌ Invalid format or empty text.", reply_markup=kb([[cancel_btn("adm:home")]]))
 
     added = 0
     skipped = 0
-    invalid = 0
 
     for item in parsed_items:
-        raw_text = item.get("raw_text", "").strip()
-        if not raw_text:
-            invalid += 1
+        email = item.get("email", "")
+        if not email or email == "N/A":
             continue
 
-        raw_enc = enc(raw_text)
-
-        existing = await db.inventory.find_one({"raw_text_enc": raw_enc})
+        email_enc = enc(email)
+        existing = await db.inventory.find_one({"details.email_enc": email_enc})
         if existing:
             skipped += 1
             continue
@@ -1198,8 +880,13 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
             "item_id": item_id,
             "gv_type": gv_type,
             "price_cents": price_cents,
-            "raw_text_enc": raw_enc,
-            "code_enc": raw_enc,
+            "details": {
+                "email_enc": email_enc,
+                "pass_enc": enc(item.get("password", "N/A")),
+                "rec_enc": enc(item.get("rec_email", "N/A")),
+                "rec_pass_2fa_enc": enc(item.get("rec_pass_2fa", "N/A")),
+                "phone_enc": enc(item.get("phone", "N/A"))
+            },
             "status": "available",
             "created_at": now(),
             "added_by": m.from_user.id,
@@ -1215,18 +902,11 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
 
     report_text = (
         f"🤖 <b>Gemini AI Parsing Complete!</b>\n\n"
-        f"✔ <b>{added} added live</b> · <b>skipped {skipped} duplicates</b> · <b>{invalid} invalid</b>.\n\n"
-        f"📦 <b>Supplier Panel Status</b>\n\n"
-        f"🟢 Live Stock: <b>{live_count}</b> · 🔴 Sold: <b>{sold_count}</b>\n"
-        f"🧩 Products: <b>2</b>"
+        f"✔ <b>{added} accounts added</b> · <b>{skipped} duplicates skipped</b>.\n\n"
+        f"🟢 Total Live Stock: <b>{live_count}</b> · 🔴 Sold: <b>{sold_count}</b>"
     )
 
-    reply_markup = kb([
-        [btn("➕ Add Stock", "adm:add_choice", "success")],
-        [back("adm:home", "🏠 Admin Menu")]
-    ])
-
-    await m.answer(report_text, reply_markup=reply_markup)
+    await m.answer(report_text, reply_markup=kb([[btn("➕ Add More Stock", "adm:add_choice", "success")], [back("adm:home")]]))
 
 
 @admin_router.callback_query(F.data.startswith("adm:ai:"))
@@ -1261,7 +941,7 @@ async def cb_active_item_view(c: CallbackQuery):
     )
 
     rows = [
-        [btn("🗑 Delete This GV", f"adm:id:{item_id}", "danger")],
+        [btn("🗑 Delete This Account", f"adm:id:{item_id}", "danger")],
         [back("adm:ai:0")]
     ]
     await show(c, text, kb(rows))
@@ -1282,8 +962,8 @@ async def cb_delete_all_confirm(c: CallbackQuery):
         return await alert(c, "There is no available stock to delete.")
 
     text = (
-        f"⚠️ <b>ARE YOU SURE?</b>\n\n"
-        f"You are about to permanently delete <b>{active_count}</b> available Google Voice accounts from the inventory.\n\n"
+        f"⚠️️ <b>ARE YOU SURE?</b>\n\n"
+        f"You are about to permanently delete <b>{active_count}</b> available Google Voice accounts.\n\n"
         f"This action cannot be undone."
     )
     rows = [
@@ -1296,11 +976,7 @@ async def cb_delete_all_confirm(c: CallbackQuery):
 @admin_router.callback_query(F.data == "adm:del_all_execute")
 async def cb_delete_all_execute(c: CallbackQuery):
     res = await db.inventory.delete_many({"status": "available"})
-    await show(
-        c,
-        f"✅ <b>Successfully deleted {res.deleted_count} available accounts!</b>",
-        kb([[back("adm:home")]])
-    )
+    await show(c, f"✅ <b>Deleted {res.deleted_count} available accounts!</b>", kb([[back("adm:home")]]))
 
 
 @admin_router.callback_query(F.data.startswith("adm:ss:"))
@@ -1318,28 +994,23 @@ async def cb_admin_stats(c: CallbackQuery):
     users = await db.users.count_documents({})
     active = await db.inventory.count_documents({"status": "available"})
     sold = await db.inventory.count_documents({"status": "sold"})
-    pending_dep = await db.payments.count_documents({"status": "pending"})
 
     net_io = psutil.net_io_counters()
     bytes_sent = fmt_bytes(net_io.bytes_sent)
     bytes_recv = fmt_bytes(net_io.bytes_recv)
-    packets_sent = net_io.packets_sent
-    packets_recv = net_io.packets_recv
 
     pipeline = [{"$match": {"status": "completed"}}, {"$group": {"_id": None, "total": {"$sum": "$amount_cents"}}}]
     rev_res = await db.orders.aggregate(pipeline).to_list(1)
     rev_cents = rev_res[0]["total"] if rev_res else 0
 
     text = (
-        f"📊 <b>Store Analytics & Server Data Usage</b>\n\n"
+        f"📊 <b>Store Analytics</b>\n\n"
         f"👥 Registered Users: <b>{users}</b>\n"
         f"📦 Active In-Stock Items: <b>{active}</b>\n"
         f"🛒 Total Items Sold: <b>{sold}</b>\n"
-        f"💰 Total Sales Revenue: <b>{money(rev_cents)}</b>\n"
-        f"💳 Pending Deposit Verifications: <b>{pending_dep}</b>\n\n"
-        f"📡 <b>Server Data Usage Stats:</b>\n"
-        f"⬆️ Total Data Sent: <b>{bytes_sent}</b> ({packets_sent:,} packets)\n"
-        f"⬇️ Total Data Received: <b>{bytes_recv}</b> ({packets_recv:,} packets)"
+        f"💰 Total Sales Revenue: <b>{money(rev_cents)}</b>\n\n"
+        f"📡 <b>Data Usage:</b>\n"
+        f"⬆️ Sent: <b>{bytes_sent}</b> · ⬇️ Recv: <b>{bytes_recv}</b>"
     )
     await show(c, text, kb([[back("adm:home")]]))
 
@@ -1358,14 +1029,43 @@ async def msg_terms_update(m: Message, state: FSMContext):
     await m.answer("✅ Terms updated successfully.", reply_markup=kb([[back("adm:home")]]))
 
 
-# ═══════════════════════════════ APPLICATION ENTRY ═══════════════════════════════
+# ════════════════════════ OXAPAY WEBHOOK SERVER ════════════════════════
+
+
+async def handle_oxapay_webhook(request):
+    """Processes incoming payment webhooks from OxaPay and fulfills orders automatically."""
+    try:
+        data = await request.json()
+        status = data.get("status")
+        track_id = data.get("trackId")
+
+        if status == "Paid" and track_id:
+            payment = await db.payments.find_one({"track_id": track_id, "status": "pending"})
+            if payment:
+                await db.payments.update_one({"track_id": track_id}, {"$set": {"status": "completed"}})
+                order, items, err = await fulfill_order(
+                    payment["user_id"], payment["gv_type"], payment["quantity"], track_id
+                )
+                if order and items:
+                    accounts_str = "\n\n".join([f"<b>Account #{i}:</b>\n{delivery_block(item)}" for i, item in enumerate(items, 1)])
+                    delivered_text = (
+                        f"✅ <b>Payment Received! Order Delivered!</b>\n\n"
+                        f"<b>Order ID:</b> <code>{order['order_id']}</code>\n\n"
+                        f"{accounts_str}"
+                    )
+                    await safe_send(payment["user_id"], text=delivered_text, parse_mode=ParseMode.HTML)
+        return web.json_response({"status": "ok"})
+    except Exception as e:
+        log.error("OxaPay Webhook Error: %s", e)
+        return web.json_response({"status": "error"}, status=400)
+
+
+# ════════════════════════ APPLICATION ENTRY ════════════════════════
 
 
 async def main():
     global bot_ref
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    if "REPLACE" in config.BOT_TOKEN:
-        raise SystemExit("Please configure BOT_TOKEN in config.py.")
 
     await init_db()
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
@@ -1378,9 +1078,17 @@ async def main():
     dp.include_router(admin_router)
     dp.include_router(user_router)
 
+    # Webhook server for OxaPay Auto Payment Callbacks
+    app = web.Application()
+    app.router.add_post("/oxapay/callback", handle_oxapay_webhook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", config.WEBHOOK_PORT)
+    await site.start()
+
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        log.info("Bot started successfully in Crypto Deposit Mode with Gemini AI Parser.")
+        log.info("Bot started with OxaPay Automatic Crypto Processing and Gemini AI Parser.")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await bot.session.close()

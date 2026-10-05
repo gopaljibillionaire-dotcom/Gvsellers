@@ -1,9 +1,5 @@
 """
 config.py — all configuration and secrets for the digital store bot.
-
-Every value can be overridden with an environment variable (handy on Heroku /
-Railway / Docker), otherwise edit the defaults below. Secrets live ONLY here
-(or in env vars) and are never sent to Telegram.
 """
 import os
 
@@ -43,15 +39,23 @@ DATABASE_NAME = os.getenv("DATABASE_NAME", "digital_store")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ──────────────────────── OxaPay Integration ────────────────────────
-# Merchant key used for generating invoices/payments
-OXAPAY_MERCHANT_KEY = os.getenv("OXAPAY_MERCHANT_KEY", "")
+# OxaPay Merchant Key used for generating payment invoices and white-label addresses
+OXAPAY_MERCHANT_KEY = os.getenv("OXAPAY_MERCHANT_KEY", "YOUR_OXAPAY_MERCHANT_KEY")
+OXAPAY_API_KEY = os.getenv("OXAPAY_API_KEY", "YOUR_OXAPAY_API_KEY")
 
-# API key used for general OxaPay API operations (payouts, info, etc.)
-OXAPAY_API_KEY = os.getenv("OXAPAY_API_KEY", "")
+# Webhook Callback URL for OxaPay Payment Notifications
+# (Set this to your public domain/Heroku/Railway URL e.g. https://your-domain.com/oxapay/callback)
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
 
 # OxaPay Endpoints
 OXAPAY_CREATE_INVOICE_URL = "https://api.oxapay.com/merchants/request"
 OXAPAY_WHITE_LABEL_URL = "https://api.oxapay.com/merchants/request/whitelabel"
+
+# Top 10 Supported Automatic OxaPay Cryptocurrencies
+TOP_10_CURRENCIES = [
+    "USDT", "BTC", "LTC", "SOL", "TRX", "TON", "ETH", "BNB", "DOGE", "XRP"
+]
 
 MIN_DEPOSIT = "1.00"     # default minimum deposit (USD)
 MAX_DEPOSIT = "500.00"   # default maximum deposit (USD)
@@ -69,6 +73,6 @@ TERMS_TEXT = (
     "1. All products sold here are legally owned or properly authorized digital products.\n"
     "2. Fraudulent payments, chargeback abuse, and unauthorized access will result in a permanent ban.\n"
     "3. Delivered digital products are non-refundable once revealed, unless proven invalid.\n"
-    "4. Wallet funds are credited only after payment verification.\n\n"
+    "4. Payments are verified automatically via OxaPay upon blockchain confirmation.\n\n"
     "Contact support if you have any questions."
 )

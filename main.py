@@ -61,18 +61,16 @@ OXAPAY_BASE_URL = "https://api.oxapay.com/v1"
 OXAPAY_CALLBACK_URL = f"{WEBHOOK_BASE}/oxapay/callback"
 OXAPAY_TO_CURRENCY = _cfg("OXAPAY_TO_CURRENCY") or "USDT"
 OXAPAY_SANDBOX = _cfg("OXAPAY_SANDBOX").lower() in ("1", "true", "yes")
-UNDERPAY_TOLERANCE = Decimal("0.02")  # accept 2% less on static-address payments
+UNDERPAY_TOLERANCE = Decimal("0.02")
 STABLE_COINS = {"USDT", "USDC", "DAI"}
 
 mongo: Any = None
 db: Any = None
 bot_ref: Optional[Bot] = None
 
-# Default Fallback Prices (if not set in MongoDB)
-DEFAULT_NEW_GV_PRICE_CENTS = 400  # $4.00
-DEFAULT_OLD_GV_PRICE_CENTS = 600  # $6.00
-
-LOGIN_SUPPORT_NOTICE = "if you encounter any issues while logging in, please contact the support line immediately."
+# Default fallback prices ($4.00 and $6.00) if database isn't initialized yet
+DEFAULT_NEW_GV_PRICE_CENTS = 400
+DEFAULT_OLD_GV_PRICE_CENTS = 600
 
 # Banners
 IMG_WELCOME = "https://i.ibb.co/3mMm5pk8/file-00000000304481fabc208d5a014f5b11.png"
@@ -441,7 +439,7 @@ async def page_query(coll, flt: dict, sort: list, page: int, size: int = PAGE_10
     return docs, page, pages, total
 
 
-# ════════════════════════════ DATABASE & PRICING ════════════════════════════
+# ════════════════════════════ DATABASE ════════════════════════════
 
 
 async def init_db():
@@ -469,18 +467,11 @@ async def set_setting(key: str, value: Any):
     await db.settings.update_one({"key": key}, {"$set": {"value": value, "updated_at": now()}}, upsert=True)
 
 
-async def get_gv_price_cents(gv_type: str) -> int:
-    """Retrieves current price in cents for New or Old GV from settings or fallback defaults."""
-    key = "price_new_gv_cents" if gv_type == "new" else "price_old_gv_cents"
+async def get_gv_price(gv_type: str) -> int:
+    """Dynamically gets price for gv_type ('new' or 'old') in cents."""
+    key = f"price_{gv_type}_cents"
     default_price = DEFAULT_NEW_GV_PRICE_CENTS if gv_type == "new" else DEFAULT_OLD_GV_PRICE_CENTS
-    val = await get_setting(key, default_price)
-    return to_int(val, default_price)
-
-
-async def set_gv_price_cents(gv_type: str, cents: int):
-    """Sets new price in cents for New or Old GV in settings."""
-    key = "price_new_gv_cents" if gv_type == "new" else "price_old_gv_cents"
-    await set_setting(key, cents)
+    return await get_setting(key, default_price)
 
 
 async def get_user_balance(user_id: int) -> int:
@@ -492,8 +483,8 @@ async def get_user_balance(user_id: int) -> int:
 
 
 async def fulfill_order(user_id: int, gv_type: str, qty: int, track_id: str) -> tuple[Optional[dict], Optional[list], Optional[str]]:
-    """Fulfills order after payment confirmation by fetching requested stock items."""
-    unit_price = await get_gv_price_cents(gv_type)
+    """Fulfills order after payment confirmation by fetching stock items."""
+    unit_price = await get_gv_price(gv_type)
     total_cents = unit_price * qty
     gv_title = "New GV" if gv_type == "new" else "Old GV"
     t = now()
@@ -538,11 +529,14 @@ async def fulfill_order(user_id: int, gv_type: str, qty: int, track_id: str) -> 
     return order, available_items, None
 
 
-def delivery_block(item: dict, index: Optional[int] = None) -> str:
-    """Formats full GV account metadata with individually copyable code tags."""
+def delivery_block(item: dict) -> str:
+    """Formats GV account details strictly as plain unescaped text lines."""
     dt = item.get("details", {})
-    header = f"🔑 <b>Account #{index}:</b>\n" if index is not None else "🔑 <b>Account Details:</b>\n"
-    
+    if dt and dt.get("raw_line_enc"):
+        raw_text = dec(dt["raw_line_enc"])
+        if raw_text:
+            return esc(raw_text)
+
     if dt:
         email = dec(dt.get("email_enc", ""))
         password = dec(dt.get("pass_enc", ""))
@@ -550,29 +544,10 @@ def delivery_block(item: dict, index: Optional[int] = None) -> str:
         rec_pass_2fa = dec(dt.get("rec_pass_2fa_enc", ""))
         phone = dec(dt.get("phone_enc", ""))
 
-        lines = []
-        if email and email != "N/A":
-            lines.append(f"<b>Email:</b> <code>{esc(email)}</code>")
-        if password and password != "N/A":
-            lines.append(f"<b>Password:</b> <code>{esc(password)}</code>")
-        if rec_email and rec_email != "N/A":
-            lines.append(f"<b>Recovery Email:</b> <code>{esc(rec_email)}</code>")
-        if rec_pass_2fa and rec_pass_2fa != "N/A":
-            lines.append(f"<b>2FA/App Pass:</b> <code>{esc(rec_pass_2fa)}</code>")
-        if phone and phone != "N/A":
-            lines.append(f"<b>Phone Number:</b> <code>{esc(phone)}</code>")
+        parts = [p for p in [email, password, rec_email, rec_pass_2fa, phone] if p and p != "N/A"]
+        return esc("\n".join(parts))
 
-        if lines:
-            return header + "\n".join(lines)
-
-    # Fallback raw text line
-    raw_text = ""
-    if dt and dt.get("raw_line_enc"):
-        raw_text = dec(dt["raw_line_enc"])
-    if not raw_text:
-        raw_text = dec(item.get('code_enc', ''))
-
-    return f"{header}<code>{esc(raw_text)}</code>"
+    return esc(dec(item.get('code_enc', '')))
 
 
 # ═══════════════════════ MIDDLEWARES & STATES ═══════════════════════
@@ -612,17 +587,17 @@ class BulkAddStockSt(StatesGroup):
     raw_data = State()
 
 
-class SetPriceSt(StatesGroup):
-    gv_type = State()
-    price = State()
-
-
 class TermsSt(StatesGroup):
     text = State()
 
 
 class SupportSt(StatesGroup):
     msg = State()
+
+
+class SetPriceSt(StatesGroup):
+    new_price = State()
+    old_price = State()
 
 
 user_router = Router(name="user")
@@ -682,7 +657,7 @@ async def cb_topup_wallet(c: CallbackQuery, state: FSMContext):
 @user_router.message(TopUpSt.amount, F.text)
 async def msg_topup_amount(m: Message, state: FSMContext):
     cents = parse_money(m.text)
-    if not cents or cents < 100:  # Minimum top-up $1.00
+    if not cents or cents < 100:
         return await m.answer("❌ Minimum top-up amount is $1.00. Please enter a valid amount (e.g. 10 or 25.50):", reply_markup=kb([[cancel_btn("home")]]))
 
     await state.clear()
@@ -781,9 +756,8 @@ async def cb_pay_topup_panel(c: CallbackQuery):
 @user_router.callback_query(F.data.startswith("pl:"))
 async def cb_products_list(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    new_price = await get_gv_price_cents("new")
-    old_price = await get_gv_price_cents("old")
-
+    new_price = await get_gv_price("new")
+    old_price = await get_gv_price("old")
     rows = [
         [btn(f"🟢 New GV — {money(new_price)}", "gv_select:new", "success")],
         [btn(f"📜 Old GV — {money(old_price)}", "gv_select:old", "primary")],
@@ -797,7 +771,7 @@ async def cb_products_list(c: CallbackQuery, state: FSMContext):
 async def cb_gv_select(c: CallbackQuery, state: FSMContext):
     await state.clear()
     gv_type = c.data.split(":")[1]
-    unit_cents = await get_gv_price_cents(gv_type)
+    unit_cents = await get_gv_price(gv_type)
     gv_title = "New GV" if gv_type == "new" else "Old GV"
 
     available_count = await db.inventory.count_documents({"gv_type": gv_type, "status": "available"})
@@ -858,7 +832,7 @@ async def cb_gv_checkout(c: CallbackQuery, state: FSMContext):
 
 
 async def render_gv_payment_options(ev, user_id: int, gv_type: str, qty: int):
-    unit_cents = await get_gv_price_cents(gv_type)
+    unit_cents = await get_gv_price(gv_type)
     total_cents = unit_cents * qty
     total_usd = total_cents / 100.0
     gv_title = "New GV" if gv_type == "new" else "Old GV"
@@ -866,12 +840,11 @@ async def render_gv_payment_options(ev, user_id: int, gv_type: str, qty: int):
     available_count = await db.inventory.count_documents({"gv_type": gv_type, "status": "available"})
     if available_count < qty:
         text = f"❌ <b>Not enough stock!</b> Required: <b>{qty}</b>, Available: <b>{available_count}</b>."
-        rows = [[back(f"gv_select:{gv_type}", "⬅️️ Change Quantity")]]
+        rows = [[back(f"gv_select:{gv_type}", "⬅️ Change Quantity")]]
         return await show(ev, text, kb(rows), photo_url=IMG_BUY_GV)
 
     user_bal = await get_user_balance(user_id)
 
-    # 1. User HAS enough balance to pay directly
     if user_bal >= total_cents:
         text = (
             f"🛍 <b>Order Summary: {gv_title}</b>\n\n"
@@ -886,7 +859,6 @@ async def render_gv_payment_options(ev, user_id: int, gv_type: str, qty: int):
         ]
         return await show(ev, text, kb(rows), photo_url=IMG_BUY_GV)
 
-    # 2. User DOES NOT have enough balance -> Show Top Up button
     needed_cents = total_cents - user_bal
     text = (
         f"🛍 <b>Order Summary: {gv_title}</b>\n\n"
@@ -909,7 +881,7 @@ async def render_gv_payment_options(ev, user_id: int, gv_type: str, qty: int):
 async def cb_buy_with_balance(c: CallbackQuery):
     _, gv_type, qty_str = c.data.split(":")
     qty = to_int(qty_str)
-    unit_cents = await get_gv_price_cents(gv_type)
+    unit_cents = await get_gv_price(gv_type)
     total_cents = unit_cents * qty
     uid = c.from_user.id
 
@@ -935,27 +907,45 @@ async def cb_buy_with_balance(c: CallbackQuery):
         await db.users.update_one({"user_id": uid}, {"$inc": {"balance_cents": total_cents}})
         return await alert(c, f"❌ Purchase failed: {err}. Your balance was refunded.")
 
-    # 1. Main purchase confirmation header
-    summary_text = (
-        f"✅ <b>Purchase Successful!</b>\n\n"
-        f"<b>Order ID:</b> <code>{order['order_id']}</code>\n"
-        f"<b>Quantity:</b> {qty}\n"
-        f"<b>Total Amount Deducted:</b> {money(total_cents)}\n\n"
-        f"📦 <i>Delivering account details below...</i>"
-    )
     order_markup = kb([
         [btn("📦 My Orders", "ol:0", "primary"), btn("🏠 Home", "home", "primary")]
     ])
-    await show(c, summary_text, order_markup)
 
-    # 2. Send EACH GV in a separate message with copyable fields & login notice
-    for idx, item in enumerate(items, 1):
-        block_text = (
-            f"📦 <b>Order ID:</b> <code>{order['order_id']}</code>\n\n"
-            f"{delivery_block(item, index=idx if qty > 1 else None)}\n\n"
-            f"⚠️ <i>{LOGIN_SUPPORT_NOTICE}</i>"
+    # Dynamic delivery logic: Single vs Multiple accounts
+    if len(items) == 1:
+        item_block = delivery_block(items[0])
+        text = (
+            f"✅ <b>Purchase Successful!</b>\n\n"
+            f"<b>Order ID: {order['order_id']}</b>\n"
+            f"<b>Amount Deducted: {money(total_cents)}</b>\n\n"
+            f"<b>Delivered Account Details:</b>\n"
+            f"🔑 <b>Account Details:</b>\n"
+            f"<pre>{item_block}</pre>\n\n"
+            f"<i>if you encounter any issues while logging in, please contact the support line immediately.</i>"
         )
-        await safe_send(uid, text=block_text, parse_mode=ParseMode.HTML)
+        await show(c, text, order_markup)
+    else:
+        # Multiple items: edit current menu message with summary then send individual messages
+        summary_text = (
+            f"✅ <b>Purchase Successful!</b>\n\n"
+            f"<b>Order ID: {order['order_id']}</b>\n"
+            f"<b>Amount Deducted: {money(total_cents)}</b>\n"
+            f"<b>Accounts Purchased: {len(items)}</b>\n\n"
+            f"📩 <i>Sending your {len(items)} separate Google Voice account details below...</i>"
+        )
+        await show(c, summary_text, order_markup)
+
+        # Send 1 message per GV account
+        for idx, item in enumerate(items, 1):
+            item_block = delivery_block(item)
+            single_msg = (
+                f"✅ <b>Google Voice Account #{idx} of {len(items)}</b>\n"
+                f"<b>Order ID: {order['order_id']}</b>\n\n"
+                f"🔑 <b>Account Details:</b>\n"
+                f"<pre>{item_block}</pre>\n\n"
+                f"<i>if you encounter any issues while logging in, please contact the support line immediately.</i>"
+            )
+            await safe_send(uid, text=single_msg, parse_mode=ParseMode.HTML)
 
 
 def support_button():
@@ -1046,18 +1036,19 @@ async def cb_order_view(c: CallbackQuery):
     delivered_blocks = []
     if o.get("item_ids"):
         items = await db.inventory.find({"item_id": {"$in": o["item_ids"]}}).to_list(len(o["item_ids"]))
-        for idx, item in enumerate(items, 1):
-            delivered_blocks.append(delivery_block(item, index=idx if len(items) > 1 else None))
+        for item in items:
+            delivered_blocks.append(f"<pre>{delivery_block(item)}</pre>")
 
     delivered_text = "\n\n".join(delivered_blocks)
 
     text = (
-        f"✅ <b>Order Summary: {o['order_id']}</b>\n\n"
-        f"Product: <b>{o['product_name']}</b>\n"
-        f"Amount Paid: <b>{money(o['amount_cents'])}</b>\n\n"
-        f"<b>Delivered Accounts:</b>\n\n"
+        f"✅ <b>Purchase Successful!</b>\n\n"
+        f"<b>Order ID: {o['order_id']}</b>\n"
+        f"<b>Amount Deducted: {money(o['amount_cents'])}</b>\n\n"
+        f"<b>Delivered Account Details:</b>\n"
+        f"🔑 <b>Account Details:</b>\n"
         f"{delivered_text}\n\n"
-        f"⚠️ <i>{LOGIN_SUPPORT_NOTICE}</i>"
+        f"<i>if you encounter any issues while logging in, please contact the support line immediately.</i>"
     )
 
     await show(c, text, kb([[back("ol:0")]]))
@@ -1101,8 +1092,8 @@ async def cb_terms(c: CallbackQuery):
 def admin_menu() -> InlineKeyboardMarkup:
     return kb([
         [btn("➕ Add Stock", "adm:add_choice", "success"), btn("📦 Active Stock", "adm:ai:0", "primary")],
-        [btn("💲 Set GV Prices", "adm:set_price_choice", "primary"), btn("🛒 Sold Stock", "adm:ss:0", "primary")],
-        [btn("🔥 Delete Available Stock", "adm:del_all_confirm", "danger")],
+        [btn("💲 Set Price Option", "adm:set_price_menu", "success")],
+        [btn("🔥 Delete Available Stock", "adm:del_all_confirm", "danger"), btn("🛒 Sold Stock", "adm:ss:0", "primary")],
         [btn("💣 PURGE ALL BOT DATA", "adm:purge_confirm", "danger")],
         [btn("📊 Statistics & Data Usage", "adm:st", "primary")],
         [btn("📝 Terms", "adm:tm", "primary")],
@@ -1122,65 +1113,65 @@ async def cb_admin_home(c: CallbackQuery, state: FSMContext):
     await show(c, "⚙️ <b>Admin Control Panel</b>", admin_menu())
 
 
-# ── Set Dynamic Price System ──
+# ── Set GV Price Admin Option ──
 
 
-@admin_router.callback_query(F.data == "adm:set_price_choice")
-async def cb_set_price_choice(c: CallbackQuery, state: FSMContext):
+@admin_router.callback_query(F.data == "adm:set_price_menu")
+async def cb_set_price_menu(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    new_p = await get_gv_price_cents("new")
-    old_p = await get_gv_price_cents("old")
+    new_price = await get_gv_price("new")
+    old_price = await get_gv_price("old")
 
     text = (
-        f"💲 <b>Set Product Prices</b>\n\n"
-        f"🟢 <b>New GV Price:</b> {money(new_p)}\n"
-        f"📜 <b>Old GV Price:</b> {money(old_p)}\n\n"
-        f"Select category to update price:"
+        f"💲 <b>Set Product Prices Menu</b>\n\n"
+        f"<b>Current Prices:</b>\n"
+        f"• 🟢 New GV: <b>{money(new_price)}</b>\n"
+        f"• 📜 Old GV: <b>{money(old_price)}</b>\n\n"
+        f"Select which price you want to update:"
     )
 
     rows = [
-        [btn(f"🟢 Set New GV Price ({money(new_p)})", "adm:sp_prompt:new", "success")],
-        [btn(f"📜 Set Old GV Price ({money(old_p)})", "adm:sp_prompt:old", "primary")],
+        [btn(f"Set New GV Price ({money(new_price)})", "adm:set_p_prompt:new", "primary")],
+        [btn(f"Set Old GV Price ({money(old_price)})", "adm:set_p_prompt:old", "primary")],
         [back("adm:home")]
     ]
     await show(c, text, kb(rows))
 
 
-@admin_router.callback_query(F.data.startswith("adm:sp_prompt:"))
-async def cb_set_price_prompt(c: CallbackQuery, state: FSMContext):
+@admin_router.callback_query(F.data.startswith("adm:set_p_prompt:"))
+async def cb_set_p_prompt(c: CallbackQuery, state: FSMContext):
     gv_type = c.data.split(":")[2]
-    curr_price = await get_gv_price_cents(gv_type)
-    gv_title = "New GV" if gv_type == "new" else "Old GV"
+    target_state = SetPriceSt.new_price if gv_type == "new" else SetPriceSt.old_price
+    await state.set_state(target_state)
 
-    await state.update_data(gv_type=gv_type)
-    await state.set_state(SetPriceSt.price)
+    gv_title = "New GV" if gv_type == "new" else "Old GV"
+    curr_price = await get_gv_price(gv_type)
 
     text = (
-        f"💲 <b>Set New Price for {gv_title}</b>\n\n"
+        f"✏️ <b>Set New Price for {gv_title}</b>\n\n"
         f"Current Price: <b>{money(curr_price)}</b>\n\n"
-        f"Please enter the new price in USD (e.g., <code>3.50</code>, <code>5</code>, or <code>6.25</code>):"
+        f"Please enter the new price in USD (e.g., <code>3.50</code>, <code>5</code>, or <code>6.00</code>):"
     )
-    await show(c, text, kb([[cancel_btn("adm:set_price_choice")]]))
+    await show(c, text, kb([[cancel_btn("adm:set_price_menu")]]))
 
 
-@admin_router.message(SetPriceSt.price, F.text)
-async def msg_set_price_save(m: Message, state: FSMContext):
+@admin_router.message(SetPriceSt.new_price, F.text)
+@admin_router.message(SetPriceSt.old_price, F.text)
+async def msg_save_gv_price(m: Message, state: FSMContext):
+    curr_state = await state.get_state()
+    gv_type = "new" if curr_state == SetPriceSt.new_price.state else "old"
+
     cents = parse_money(m.text)
-    if not cents or cents < 1:
-        return await m.answer("❌ Invalid price format. Please enter a valid USD amount (e.g. 4 or 5.50):", reply_markup=kb([[cancel_btn("adm:set_price_choice")]]))
+    if not cents or cents <= 0:
+        return await m.answer("❌ Invalid price amount. Please enter a valid positive number (e.g. 4.00 or 6):", reply_markup=kb([[cancel_btn("adm:set_price_menu")]]))
 
-    data = await state.get_data()
-    gv_type = data.get("gv_type", "new")
+    await set_setting(f"price_{gv_type}_cents", cents)
     await state.clear()
 
-    await set_gv_price_cents(gv_type, cents)
     gv_title = "New GV" if gv_type == "new" else "Old GV"
-
     await m.answer(
-        f"✅ <b>Price Updated Successfully!</b>\n\n"
-        f"Product: <b>{gv_title}</b>\n"
-        f"New Price: <b>{money(cents)}</b>",
-        reply_markup=kb([[btn("⬅️ Back to Prices", "adm:set_price_choice", "primary")], [back("adm:home")]])
+        f"✅ <b>Price Updated!</b>\n\n{gv_title} price has been changed to <b>{money(cents)}</b>.",
+        reply_markup=kb([[btn("💲 Set Price Menu", "adm:set_price_menu", "primary")], [back("adm:home")]])
     )
 
 
@@ -1224,9 +1215,8 @@ async def cb_purge_execute(c: CallbackQuery):
 @admin_router.callback_query(F.data == "adm:add_choice")
 async def cb_add_stock_choice(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    new_price = await get_gv_price_cents("new")
-    old_price = await get_gv_price_cents("old")
-
+    new_price = await get_gv_price("new")
+    old_price = await get_gv_price("old")
     rows = [
         [btn(f"🟢 New GV ({money(new_price)})", "adm:add_stock:new", "success")],
         [btn(f"📜 Old GV ({money(old_price)})", "adm:add_stock:old", "primary")],
@@ -1257,7 +1247,7 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
 
     data = await state.get_data()
     gv_type = data.get("gv_type", "new")
-    price_cents = await get_gv_price_cents(gv_type)
+    price_cents = await get_gv_price(gv_type)
 
     processing_msg = await m.answer("🧠 <i>Gemini AI is parsing and splitting account entries...</i>", parse_mode=ParseMode.HTML)
 
@@ -1346,7 +1336,8 @@ async def cb_active_item_view(c: CallbackQuery):
         f"Type: <b>{item.get('gv_type', 'N/A').upper()}</b>\n"
         f"Price: <b>{money(item['price_cents'])}</b>\n"
         f"Status: <b>{item['status']}</b>\n\n"
-        f"{delivery_block(item)}"
+        f"🔑 <b>Credentials:</b>\n"
+        f"<pre>{delivery_block(item)}</pre>"
     )
 
     rows = [

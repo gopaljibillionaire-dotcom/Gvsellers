@@ -10,12 +10,12 @@ def _int_list(raw: str, default: list) -> list:
 
 
 # ───────────────────────────── Telegram ─────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "123456:REPLACE_ME")
-ADMIN_IDS = _int_list(os.getenv("ADMIN_IDS", ""), [123456789])  # comma-separated Telegram user IDs
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS = _int_list(os.getenv("ADMIN_IDS", ""), [])  # comma-separated Telegram user IDs
 
 # Support
 SUPPORT_ID = int(os.getenv("SUPPORT_ID", "5395804191769763641"))
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "your_support_username")  # without @
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "")  # without @
 
 # Telegram custom (premium) emoji IDs
 STORE_EMOJI_ID = "5451937962629544243"        # 🛍 Store / General
@@ -32,7 +32,7 @@ SUPPORT_EMOJI_ID = "5395804191769763641"      # 🎧 Support
 GIFTS_EMOJI_ID = "5368324170671202286"        # 🎁 Buy Gifts / Special
 
 # ───────────────────────────── MongoDB ──────────────────────────────
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = os.getenv("MONGO_URI", "")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "digital_store")
 
 # ──────────────────────────── AI / Gemini ───────────────────────────
@@ -40,8 +40,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ──────────────────────── OxaPay Integration ────────────────────────
 # OxaPay Merchant Key used for generating payment invoices and white-label addresses
-OXAPAY_MERCHANT_KEY = os.getenv("OXAPAY_MERCHANT_KEY", "YOUR_OXAPAY_MERCHANT_KEY")
-OXAPAY_API_KEY = os.getenv("OXAPAY_API_KEY", "YOUR_OXAPAY_API_KEY")
+OXAPAY_MERCHANT_KEY = os.getenv("OXAPAY_MERCHANT_KEY", "")
+OXAPAY_API_KEY = os.getenv("OXAPAY_API_KEY", "")
 
 # Webhook Callback URL for OxaPay Payment Notifications
 # (Set this to your public domain/Heroku/Railway URL e.g. https://your-domain.com/oxapay/callback)

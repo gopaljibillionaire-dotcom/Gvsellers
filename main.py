@@ -47,6 +47,10 @@ ADMIN_SET = set(config.ADMIN_IDS)
 PAGE_10 = 10
 MAX_PRICE_CENTS = 10_000_000
 
+# Overridden active credentials for guaranteed OxaPay integration
+OXAPAY_MERCHANT_KEY = getattr(config, "OXAPAY_MERCHANT_KEY", "OXAIYylhi8ve5wkG7H5q5PCDgL")
+OXAPAY_API_KEY = getattr(config, "OXAPAY_API_KEY", "SLXIKW-1VLVHO-YDNVDP-ZPDOEW")
+
 mongo: Any = None
 db: Any = None
 bot_ref: Optional[Bot] = None
@@ -136,10 +140,10 @@ def parse_gv_lines_fallback(text: str) -> list[dict[str, Any]]:
 # ════════════════════════════ OXAPAY API INTEGRATION ════════════════════════════
 
 
-async def create_oxapay_static_address(user_id: int, currency: str, amount_usd: float) -> Optional[dict]:
-    """Generates an automatic white-label payment address pre-selected for a specific currency."""
+async def create_oxapay_static_address(user_id: int, currency: str, amount_usd: float) -> tuple[Optional[dict], str]:
+    """Generates an automatic payment address pre-selected for a specific currency."""
     payload = {
-        "merchant": config.OXAPAY_MERCHANT_KEY,
+        "merchant": OXAPAY_MERCHANT_KEY,
         "amount": amount_usd,
         "currency": "USD",
         "payCurrency": currency.upper(),
@@ -150,24 +154,26 @@ async def create_oxapay_static_address(user_id: int, currency: str, amount_usd: 
         "orderId": f"USER_{user_id}_{int(datetime.now().timestamp())}"
     }
 
-    url = getattr(config, "OXAPAY_WHITE_LABEL_URL", "https://api.oxapay.com/merchants/request/whitelabel")
+    url = "https://api.oxapay.com/merchants/request/whitelabel"
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=12) as resp:
                 data = await resp.json()
                 if data.get("result") == 100:
-                    return data
+                    return data, ""
+                err_msg = data.get("message", json.dumps(data))
                 log.error("OxaPay Address Error details: %s", data)
+                return None, err_msg
     except Exception as e:
         log.error("OxaPay API Error (White Label): %s", e)
-    return None
+        return None, str(e)
 
 
-async def create_oxapay_full_invoice(user_id: int, amount_usd: float, currency: Optional[str] = None) -> Optional[dict]:
-    """Generates a full OxaPay Hosted Checkout Panel invoice link (supporting full panel pre-fills)."""
+async def create_oxapay_full_invoice(user_id: int, amount_usd: float, currency: Optional[str] = None) -> tuple[Optional[dict], str]:
+    """Generates a full OxaPay Hosted Checkout Panel invoice link."""
     payload = {
-        "merchant": config.OXAPAY_MERCHANT_KEY,
+        "merchant": OXAPAY_MERCHANT_KEY,
         "amount": amount_usd,
         "currency": "USD",
         "lifeTime": 60,
@@ -179,18 +185,20 @@ async def create_oxapay_full_invoice(user_id: int, amount_usd: float, currency: 
     if currency:
         payload["payCurrency"] = currency.upper()
 
-    url = getattr(config, "OXAPAY_CREATE_INVOICE_URL", "https://api.oxapay.com/merchants/request")
+    url = "https://api.oxapay.com/merchants/request"
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=12) as resp:
                 data = await resp.json()
                 if data.get("result") == 100:
-                    return data
+                    return data, ""
+                err_msg = data.get("message", json.dumps(data))
                 log.error("OxaPay Invoice Error details: %s", data)
+                return None, err_msg
     except Exception as e:
         log.error("OxaPay API Error (Invoice): %s", e)
-    return None
+        return None, str(e)
 
 
 # ════════════════════════════ HELPERS ════════════════════════════
@@ -667,8 +675,8 @@ async def cb_pay_auto(c: CallbackQuery):
 
     await c.answer("Generating OxaPay address...")
 
-    # First attempt White-Label static address API
-    resp = await create_oxapay_static_address(c.from_user.id, currency, total_usd)
+    # Attempt 1: Static White-Label Address Generation
+    resp, err_msg = await create_oxapay_static_address(c.from_user.id, currency, total_usd)
 
     if resp and resp.get("address"):
         addr = resp["address"]
@@ -699,8 +707,8 @@ async def cb_pay_auto(c: CallbackQuery):
         rows = [[back("home", "🏠 Return to Main Menu")]]
         return await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
-    # Fallback to hosted checkout pre-filled with selected currency
-    invoice = await create_oxapay_full_invoice(c.from_user.id, total_usd, currency=currency)
+    # Attempt 2: Direct Hosted Invoice Link Fallback
+    invoice, inv_err = await create_oxapay_full_invoice(c.from_user.id, total_usd, currency=currency)
     if invoice and invoice.get("payLink"):
         pay_link = invoice["payLink"]
         track_id = str(invoice.get("trackId", ""))
@@ -721,10 +729,10 @@ async def cb_pay_auto(c: CallbackQuery):
         )
 
         text = (
-            f"⚡ <b>OxaPay Hosted Checkout Panel</b>\n\n"
+            f"⚡ <b>OxaPay Payment Panel ({currency.upper()})</b>\n\n"
             f"Amount: <b>${total_usd:.2f} USD</b>\n"
             f"Selected Coin: <b>{currency.upper()}</b>\n\n"
-            "Click <b>Pay Now</b> below to open the payment gateway panel:"
+            "Click <b>Pay Now</b> below to complete payment on OxaPay:"
         )
 
         rows = [
@@ -733,7 +741,8 @@ async def cb_pay_auto(c: CallbackQuery):
         ]
         return await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
-    await alert(c, "Failed to generate OxaPay payment. Check API Keys or try again.")
+    # Show exact failure message instead of hanging
+    await alert(c, f"OxaPay Error: {err_msg or inv_err or 'Check currency support in merchant settings'}")
 
 
 @user_router.callback_query(F.data.startswith("pay_panel:"))
@@ -744,10 +753,10 @@ async def cb_pay_panel(c: CallbackQuery):
     total_usd = (unit_cents * qty) / 100.0
 
     await c.answer("Creating payment invoice...")
-    invoice = await create_oxapay_full_invoice(c.from_user.id, total_usd)
+    invoice, err_msg = await create_oxapay_full_invoice(c.from_user.id, total_usd)
 
     if not invoice or not invoice.get("payLink"):
-        return await alert(c, "Failed to connect to OxaPay. Please try again.")
+        return await alert(c, f"OxaPay Error: {err_msg or 'Could not generate payment invoice'}")
 
     pay_link = invoice["payLink"]
     track_id = str(invoice.get("trackId", ""))
@@ -1097,7 +1106,7 @@ def verify_oxapay_hmac(body_bytes: bytes, hmac_header: Optional[str]) -> bool:
     """Verifies HMAC signature sent by OxaPay webhooks."""
     if not hmac_header:
         return True
-    api_key = getattr(config, "OXAPAY_API_KEY", config.OXAPAY_MERCHANT_KEY)
+    api_key = OXAPAY_API_KEY
     calculated = hmac.new(api_key.encode('utf-8'), body_bytes, hashlib.sha512).hexdigest()
     return hmac.compare_digest(calculated, hmac_header)
 

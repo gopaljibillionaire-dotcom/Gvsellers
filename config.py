@@ -42,28 +42,17 @@ DATABASE_NAME = os.getenv("DATABASE_NAME", "digital_store")
 # ──────────────────────────── AI / Gemini ───────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# ────────────────────── Manual Wallet Payments ──────────────────────
-# Static addresses for manual deposit transfers
-WALLETS = {
-    "USDT_TRC20": os.getenv("USDT_TRC20_WALLET", "TEmFazxBnjuxyQF3ohHReJvSghmG1DW2sX"),
-    "USDT_BEP20": os.getenv("USDT_BEP20_WALLET", "0x20c065b69618a09fb8f9ab88e07e09910d9abada"),
-    "USDT_ERC20": os.getenv("USDT_ERC20_WALLET", "0x20c065b69618a09fb8f9ab88e07e09910d9abada"),
-    "BTC": os.getenv("BTC_WALLET", "1KiZw2SmvhWZCY8Rj3bZMifMkkF82BK6UX"),
-    "ETH": os.getenv("ETH_WALLET", "0x20c065b69618a09fb8f9ab88e07e09910d9abada"),
-    "SOL": os.getenv("SOL_WALLET", "9bQPXaQqdZe4XzLeZrPbfJMu7e5sbgDWhNKgifDu4M7Q"),
-}
+# ──────────────────────── OxaPay Integration ────────────────────────
+# Merchant key used for generating invoices/payments
+OXAPAY_MERCHANT_KEY = os.getenv("OXAPAY_MERCHANT_KEY", "")
 
-# Mapping between wallet key and coin market API ID
-CURRENCY_PRICE_IDS = {
-    "USDT_TRC20": "tether",
-    "USDT_BEP20": "tether",
-    "USDT_ERC20": "tether",
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "SOL": "solana",
-}
+# API key used for general OxaPay API operations (payouts, info, etc.)
+OXAPAY_API_KEY = os.getenv("OXAPAY_API_KEY", "")
 
-PRICE_API_URL = "https://api.coingecko.com/api/v3/simple/price"
+# OxaPay Endpoints
+OXAPAY_CREATE_INVOICE_URL = "https://api.oxapay.com/merchants/request"
+OXAPAY_WHITE_LABEL_URL = "https://api.oxapay.com/merchants/request/whitelabel"
+
 MIN_DEPOSIT = "1.00"     # default minimum deposit (USD)
 MAX_DEPOSIT = "500.00"   # default maximum deposit (USD)
 

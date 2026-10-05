@@ -39,6 +39,9 @@ GIFTS_EMOJI_ID = "5368324170671202286"        # 🎁 Buy Gifts / Special
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "digital_store")
 
+# ──────────────────────────── AI / Gemini ───────────────────────────
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
+
 # ────────────────────── Manual Wallet Payments ──────────────────────
 # Static addresses for manual deposit transfers
 WALLETS = {

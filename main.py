@@ -1,6 +1,6 @@
 """
-Digital product store bot — Aiogram 3.x + MongoDB (Motor) + Crypto API Payments.
-Includes complete inventory deletion (Single & Bulk Delete) + Data Usage Tracking + Dynamic Banner Images + Quantity Selection + Full Database Purge + Auto-Space-Split Parsing.
+Digital product store bot — Aiogram 3.x + MongoDB (Motor) + Crypto API Payments + Gemini AI Parser.
+Includes complete inventory deletion (Single & Bulk Delete) + Data Usage Tracking + Dynamic Banner Images + Quantity Selection + AI Parser.
 """
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import asyncio
 import base64
 import hashlib
 import html
+import json
 import logging
 import re
 import secrets
@@ -34,6 +35,8 @@ from aiogram.types import (
 )
 from aiogram.utils.formatting import Bold, CustomEmoji, Text
 from cryptography.fernet import Fernet, InvalidToken
+from google import genai
+from google.genai import types
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 
@@ -58,6 +61,75 @@ IMG_WALLET = "https://i.ibb.co/xKhG0g3D/file-00000000b8b48211b02df47384536e56.pn
 IMG_ORDERS = "https://i.ibb.co/Z6NpMbWG/file-0000000056e081fa90ef2c05289f9691.png"
 IMG_SUPPORT = "https://i.ibb.co/Bxy6JP8/file-0000000024bc8210a4acf5976393bad9.png"
 IMG_TERMS = "https://i.ibb.co/Q3R5YqjS/file-00000000910c8211957902711cb364f9.png"
+
+
+# ════════════════════════════ GEMINI AI SETUP ════════════════════════════
+
+gemini_client: Optional[genai.Client] = None
+if getattr(config, "GEMINI_API_KEY", None) and config.GEMINI_API_KEY != "YOUR_GEMINI_API_KEY_HERE":
+    gemini_client = genai.Client(api_key=config.GEMINI_API_KEY)
+
+
+async def parse_gv_lines_with_gemini(text: str) -> list[dict[str, str]]:
+    """Uses Gemini AI to intelligently parse raw account dumps into structured data."""
+    if not gemini_client or not text.strip():
+        return parse_gv_lines_fallback(text)
+
+    prompt = (
+        "Extract Google Voice / Google Account details from the provided raw text.\n"
+        "Analyze each line or block of text and return a JSON list of objects containing these exact keys:\n"
+        "- email: primary google email\n"
+        "- password: primary email password\n"
+        "- rec_email: recovery email (if available, else 'N/A')\n"
+        "- rec_pass: recovery email password or 2FA code (if available, else 'N/A')\n"
+        "- phone: phone number (if available, else 'N/A')\n"
+        "- raw_formatted: clean single-line or multi-line string combining these values nicely.\n\n"
+        "Raw text to parse:\n" + text
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1,
+            )
+        )
+        data = json.loads(response.text)
+        if isinstance(data, list):
+            parsed_accounts = []
+            for item in data:
+                raw_fmt = item.get("raw_formatted")
+                if not raw_fmt:
+                    parts = [
+                        f"Email: {item.get('email', 'N/A')}",
+                        f"Password: {item.get('password', 'N/A')}",
+                        f"Recovery Email: {item.get('rec_email', 'N/A')}",
+                        f"Recovery Pass/2FA: {item.get('rec_pass', 'N/A')}",
+                        f"Phone: {item.get('phone', 'N/A')}"
+                    ]
+                    raw_fmt = "\n".join([p for p in parts if "N/A" not in p])
+                parsed_accounts.append({"raw_text": raw_fmt, "details": item})
+            return parsed_accounts
+    except Exception as e:
+        log.error("Gemini AI Parsing failed, falling back to regex: %s", e)
+
+    return parse_gv_lines_fallback(text)
+
+
+def parse_gv_lines_fallback(text: str) -> list[dict[str, str]]:
+    """Fallback manual parser if Gemini API key is missing or encounters an error."""
+    accounts = []
+    text_clean = text.strip()
+    if not text_clean:
+        return accounts
+
+    lines = [line.strip() for line in text_clean.splitlines() if line.strip()]
+    for line in lines:
+        accounts.append({"raw_text": line})
+    return accounts
 
 
 # ════════════════════════════ HELPERS ════════════════════════════
@@ -131,39 +203,6 @@ def dec(s: str) -> str:
         return ""
 
 
-def parse_gv_lines(text: str) -> list[dict[str, str]]:
-    """
-    Parses account text inputs. If input contains multiple credentials separated by double spaces
-    or distinct newline entries, splits them into individual standalone GV account items.
-    """
-    accounts = []
-    text_clean = text.strip()
-    if not text_clean:
-        return accounts
-
-    lines = [line.strip() for line in text_clean.splitlines() if line.strip()]
-
-    for line in lines:
-        # Check if line contains double spaces or multispaces separating multiple GV credentials
-        if "  " in line:
-            parts = [p.strip() for p in re.split(r"\s{2,}", line) if p.strip()]
-            for p in parts:
-                accounts.append({"raw_text": p})
-        # Check if line has single-space separated multi-account chunks (e.g., email pass email recovery phone)
-        elif len(line.split()) >= 10:
-            # Fallback split on double spaces or tab separators
-            parts = [p.strip() for p in re.split(r"\s\s+|\t+", line) if p.strip()]
-            if len(parts) > 1:
-                for p in parts:
-                    accounts.append({"raw_text": p})
-            else:
-                accounts.append({"raw_text": line})
-        else:
-            accounts.append({"raw_text": line})
-
-    return accounts
-
-
 async def fetch_crypto_price(coin_id: str) -> Optional[float]:
     try:
         async with aiohttp.ClientSession() as session:
@@ -232,7 +271,6 @@ def main_menu(admin: bool) -> InlineKeyboardMarkup:
 
 
 async def show(ev, text: Optional[str] = None, markup=None, photo_url: Optional[str] = None):
-    """Renders text and edits or sends photo banners smoothly in the exact same message."""
     kwargs = {"caption": text, "reply_markup": markup, "parse_mode": ParseMode.HTML}
 
     if isinstance(ev, CallbackQuery):
@@ -338,7 +376,6 @@ async def bulk_purchase(user_id: int, gv_type: str, qty: int, user_info: str):
     gv_title = "New GV" if gv_type == "new" else "Old GV"
     t = now()
 
-    # Step 1: Check available items
     available_items = await db.inventory.find(
         {"gv_type": gv_type, "status": "available"}
     ).limit(qty).to_list(qty)
@@ -348,7 +385,6 @@ async def bulk_purchase(user_id: int, gv_type: str, qty: int, user_info: str):
 
     item_ids = [item["item_id"] for item in available_items]
 
-    # Step 2: Check and deduct wallet balance
     w = await db.wallets.find_one_and_update(
         {"user_id": user_id, "balance_cents": {"$gte": total_cents}},
         {"$inc": {"balance_cents": -total_cents}, "$set": {"updated_at": t}},
@@ -357,7 +393,6 @@ async def bulk_purchase(user_id: int, gv_type: str, qty: int, user_info: str):
     if not w:
         return None, None, f"Insufficient balance. You need {money(total_cents)}."
 
-    # Step 3: Reserve and update stock status to sold
     oid = new_id("ORD", 5)
     await db.inventory.update_many(
         {"item_id": {"$in": item_ids}},
@@ -942,7 +977,6 @@ def admin_menu() -> InlineKeyboardMarkup:
         [btn("💳 Pending Deposits", "adm:pd:0", "primary"), btn("⚙ Manage Wallets", "adm:wallets", "primary")],
         [btn("📊 Statistics & Data Usage", "adm:st", "primary")],
         [btn("📝 Terms", "adm:tm", "primary")],
-        [btn("💀 Complete Database Purge", "adm:purge_db_confirm", "danger")],
         [back("home", "🏠 User Menu")],
     ])
 
@@ -957,44 +991,6 @@ async def cmd_admin(m: Message, state: FSMContext):
 async def cb_admin_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await show(c, "⚙️ <b>Admin Control Panel</b>", admin_menu())
-
-
-# ── Complete Database Purge Handler ──
-
-
-@admin_router.callback_query(F.data == "adm:purge_db_confirm")
-async def cb_purge_db_confirm(c: CallbackQuery):
-    text = (
-        "🚨 <b>WARNING: COMPLETE DATABASE PURGE</b> 🚨\n\n"
-        "You are about to completely delete <b>ALL</b> data in the database:\n"
-        "• All user profiles & user money/balances\n"
-        "• All active inventory stock\n"
-        "• All order history\n"
-        "• All deposit and transaction records\n\n"
-        "<b>THIS ACTION IS IRREVERSIBLE!</b> Are you absolutely sure?"
-    )
-    rows = [
-        [btn("💀 YES, PURGE ENTIRE DATABASE", "adm:purge_db_execute", "danger")],
-        [back("adm:home", "❌ Cancel / Go Back")]
-    ]
-    await show(c, text, kb(rows))
-
-
-@admin_router.callback_query(F.data == "adm:purge_db_execute")
-async def cb_purge_db_execute(c: CallbackQuery):
-    # Purge all collections
-    await db.users.delete_many({})
-    await db.wallets.delete_many({})
-    await db.wallet_transactions.delete_many({})
-    await db.inventory.delete_many({})
-    await db.orders.delete_many({})
-    await db.payments.delete_many({})
-
-    await show(
-        c,
-        "💥 <b>DATABASE COMPLETE PURGE SUCCESSFUL!</b>\n\nAll users, money balances, stock inventory, and transaction histories have been wiped.",
-        kb([[back("adm:home")]])
-    )
 
 
 # ── Admin Dynamic Wallet Management ──
@@ -1132,7 +1128,7 @@ async def cb_view_deposit(c: CallbackQuery):
     await show(c, text, kb(rows))
 
 
-# ── Stock Management ──
+# ── Stock Management (Integrated with Gemini AI Parser) ──
 
 
 @admin_router.callback_query(F.data == "adm:add_choice")
@@ -1153,10 +1149,9 @@ async def cb_bulk_add_stock_start(c: CallbackQuery, state: FSMContext):
     await state.set_state(BulkAddStockSt.raw_data)
 
     prompt = (
-        "➕ <b>Add stock</b>\n\n"
+        "➕ <b>Add stock (Gemini AI Enabled)</b>\n\n"
         "<b>Send or paste raw account text:</b>\n"
-        "Paste account credentials as they are. The bot will deliver the entire message block exactly as provided to buyers upon purchase.\n"
-        "<i>Note: Items separated by double spaces will automatically be imported as separate accounts!</i>\n\n"
+        "Paste account credentials in any raw format. Gemini AI will analyze, format, and structure each line.\n\n"
         "<i>Send /cancel to abort.</i>"
     )
     await show(c, prompt, kb([[cancel_btn("adm:home")]]))
@@ -1172,8 +1167,11 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
     gv_type = data.get("gv_type", "new")
     price_cents = NEW_GV_PRICE_CENTS if gv_type == "new" else OLD_GV_PRICE_CENTS
 
-    parsed_items = parse_gv_lines(m.text)
+    processing_msg = await m.answer("🧠 <i>Gemini AI is parsing and structuring account data...</i>", parse_mode=ParseMode.HTML)
+
+    parsed_items = await parse_gv_lines_with_gemini(m.text)
     if not parsed_items:
+        await processing_msg.delete()
         return await m.answer("❌ Invalid format or empty text. Please check input.", reply_markup=kb([[cancel_btn("adm:home")]]))
 
     added = 0
@@ -1210,19 +1208,21 @@ async def msg_bulk_add_stock_process(m: Message, state: FSMContext):
         added += 1
 
     await state.clear()
+    await processing_msg.delete()
 
     live_count = await db.inventory.count_documents({"status": "available"})
     sold_count = await db.inventory.count_documents({"status": "sold"})
 
     report_text = (
+        f"🤖 <b>Gemini AI Parsing Complete!</b>\n\n"
         f"✔ <b>{added} added live</b> · <b>skipped {skipped} duplicates</b> · <b>{invalid} invalid</b>.\n\n"
-        f"📦 <b>Supplier panel</b>\n\n"
-        f"🟢 Live stock: <b>{live_count}</b> · 🔴 Sold: <b>{sold_count}</b>\n"
+        f"📦 <b>Supplier Panel Status</b>\n\n"
+        f"🟢 Live Stock: <b>{live_count}</b> · 🔴 Sold: <b>{sold_count}</b>\n"
         f"🧩 Products: <b>2</b>"
     )
 
     reply_markup = kb([
-        [btn("➕ Add stock", "adm:add_choice", "success")],
+        [btn("➕ Add Stock", "adm:add_choice", "success")],
         [back("adm:home", "🏠 Admin Menu")]
     ])
 
@@ -1380,7 +1380,7 @@ async def main():
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        log.info("Bot started successfully in Crypto Deposit Mode.")
+        log.info("Bot started successfully in Crypto Deposit Mode with Gemini AI Parser.")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await bot.session.close()

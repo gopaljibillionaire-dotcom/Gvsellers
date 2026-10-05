@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Optional
 
@@ -170,8 +170,8 @@ OXAPAY_NETWORKS: dict[str, list[str]] = {
 _network_cache: dict[str, str] = {}
 
 
-async def _oxapay_post(path: str, payload: dict) -> tuple[Optional[dict], str]:
-    """POST to the OxaPay v1 API. Returns (data, error_message)."""
+async def _oxapay_request(method: str, path: str, payload: Optional[dict] = None) -> tuple[Optional[dict], str]:
+    """Call the OxaPay v1 API. Returns (data, error_message)."""
     if not OXAPAY_API_KEY:
         return None, "OxaPay API key is missing (set OXAPAY_API_KEY in Heroku Config Vars)."
 
@@ -179,11 +179,15 @@ async def _oxapay_post(path: str, payload: dict) -> tuple[Optional[dict], str]:
     try:
         timeout = aiohttp.ClientTimeout(total=20)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{OXAPAY_BASE_URL}{path}", json=payload, headers=headers) as resp:
+            if method == "GET":
+                ctx = session.get(f"{OXAPAY_BASE_URL}{path}", headers=headers)
+            else:
+                ctx = session.post(f"{OXAPAY_BASE_URL}{path}", json=payload, headers=headers)
+            async with ctx as resp:
                 http_status = resp.status
                 body = await resp.json(content_type=None)
     except Exception as e:
-        log.error("OxaPay request to %s failed: %s", path, e)
+        log.error("OxaPay request %s %s failed: %s", method, path, e)
         return None, str(e)
 
     data = body.get("data") if isinstance(body, dict) else None
@@ -192,8 +196,17 @@ async def _oxapay_post(path: str, payload: dict) -> tuple[Optional[dict], str]:
 
     err = (body.get("error") or {}) if isinstance(body, dict) else {}
     msg = (err.get("message") if isinstance(err, dict) else None) or (body.get("message") if isinstance(body, dict) else None) or f"HTTP {http_status}"
-    log.error("OxaPay %s error (HTTP %s): %s", path, http_status, body)
+    log.error("OxaPay %s %s error (HTTP %s): %s", method, path, http_status, body)
     return None, str(msg)
+
+
+async def _oxapay_post(path: str, payload: dict) -> tuple[Optional[dict], str]:
+    return await _oxapay_request("POST", path, payload)
+
+
+async def fetch_payment_info(track_id: str) -> tuple[Optional[dict], str]:
+    """GET /v1/payment/{track_id} - current status + transactions of a payment."""
+    return await _oxapay_request("GET", f"/payment/{track_id}")
 
 
 async def create_oxapay_static_address(user_id: int, coin: str, order_id: str) -> tuple[Optional[dict], str]:
@@ -444,7 +457,8 @@ async def init_db():
     await db.inventory.create_index([("status", A), ("gv_type", A)])
     await db.orders.create_index("order_id", unique=True)
     await db.orders.create_index([("user_id", A), ("created_at", D)])
-    await db.payments.create_index("track_id", unique=True)
+    await db.gv_payments.create_index("track_id", unique=True)
+    await db.gv_payments.create_index([("status", A), ("created_at", D)])
     await db.settings.create_index("key", unique=True)
 
 
@@ -719,16 +733,20 @@ async def render_gv_payment_options(ev, user_id: int, gv_type: str, qty: int):
 
 
 def new_order_ref(user_id: int) -> str:
-    return f"USER_{user_id}_{int(datetime.now().timestamp())}"
+    return f"GV{user_id}-{secrets.token_hex(4)}"
 
 
 def support_button():
     return btn("💬 Contact Support", url=f"https://t.me/{config.SUPPORT_USERNAME.lstrip('@')}", style="success")
 
 
+def check_button(track_id: str):
+    return btn("🔄 Check Payment", f"chk:{track_id}", "primary")
+
+
 async def save_pending_payment(track_id: str, order_ref: str, user_id: int, gv_type: str, qty: int,
                                amount_cents: int, currency: str, kind: str):
-    await db.payments.update_one(
+    await db.gv_payments.update_one(
         {"track_id": track_id},
         {"$set": {
             "track_id": track_id,
@@ -748,8 +766,17 @@ async def save_pending_payment(track_id: str, order_ref: str, user_id: int, gv_t
     )
 
 
+def invoice_markup(track_id: str, pay_url: str):
+    return kb([
+        [btn("💲 Pay Now", url=pay_url, style="success")],
+        [check_button(track_id)],
+        [back("home", "❌ Back To Menu"), support_button()],
+    ])
+
+
 @user_router.callback_query(F.data.startswith("pay_auto:"))
 async def cb_pay_auto(c: CallbackQuery):
+    """User picked a specific coin -> create a fresh deposit address for exactly that coin."""
     _, gv_type, qty_str, coin = c.data.split(":")
     qty = to_int(qty_str)
     if qty < 1:
@@ -759,8 +786,6 @@ async def cb_pay_auto(c: CallbackQuery):
     total_cents = unit_cents * qty
     total_usd = total_cents / 100.0
     uid = c.from_user.id
-
-    await c.answer("Generating payment address...")
     order_ref = new_order_ref(uid)
 
     # 1) Static deposit address for the chosen coin
@@ -769,7 +794,11 @@ async def cb_pay_auto(c: CallbackQuery):
         addr = data["address"]
         network = data.get("network", coin)
         track_id = str(data.get("track_id", ""))
-        await save_pending_payment(track_id, order_ref, uid, gv_type, qty, total_cents, coin, "static")
+        try:
+            await save_pending_payment(track_id, order_ref, uid, gv_type, qty, total_cents, coin, "static")
+        except Exception as e:
+            log.exception("Could not save payment: %s", e)
+            return await alert(c, "Database error - please try again in a moment.")
 
         text = (
             f"⚡ <b>Pay with {esc(coin)}</b>\n\n"
@@ -777,39 +806,39 @@ async def cb_pay_auto(c: CallbackQuery):
             f"🌐 Network: <b>{esc(network)}</b>\n\n"
             f"📍 Deposit Address:\n<code>{esc(addr)}</code>\n\n"
             f"⚠️ Send <b>at least ${total_usd:.2f}</b> worth of <b>{esc(coin)}</b> on the <b>{esc(network)}</b> network only. "
-            f"Sending a different coin or network will lose your funds.\n\n"
-            f"✅ Your accounts are delivered automatically once the payment is confirmed."
+            f"Any other coin or network will be lost.\n\n"
+            f"✅ Delivery is automatic once the payment is confirmed. You can also tap <b>Check Payment</b> after sending."
         )
         row1 = []
         if coin in STABLE_COINS:
             row1.append(btn("📋 Copy Amount", copy=f"{total_usd:.2f}"))
         row1.append(btn("📋 Copy Address", copy=str(addr)))
-        rows = [row1, [back("home", "❌ Back To Menu"), support_button()]]
+        rows = [row1, [check_button(track_id)], [back("home", "❌ Back To Menu"), support_button()]]
         return await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
     # 2) Fallback: hosted invoice link
-    log.warning("Static address failed (%s) - falling back to invoice", err_msg)
+    log.warning("Static address failed for %s (%s) - falling back to invoice", coin, err_msg)
     invoice, inv_err = await create_oxapay_full_invoice(uid, total_usd, order_ref)
     if invoice:
         track_id = str(invoice.get("track_id", ""))
-        await save_pending_payment(track_id, order_ref, uid, gv_type, qty, total_cents, "MULTI", "invoice")
+        try:
+            await save_pending_payment(track_id, order_ref, uid, gv_type, qty, total_cents, "MULTI", "invoice")
+        except Exception as e:
+            log.exception("Could not save payment: %s", e)
+            return await alert(c, "Database error - please try again in a moment.")
         text = (
             f"🧾 <b>Payment Invoice</b>\n\n"
             f"💵 Amount: <b>${total_usd:.2f} USD</b>\n\n"
-            "Tap <b>Pay Now</b> to complete your payment. Your accounts are delivered automatically once it is confirmed."
+            "Tap <b>Pay Now</b> to complete your payment. Delivery is automatic once it is confirmed."
         )
-        rows = [
-            [btn("💲 Pay Now", url=invoice["payment_url"], style="success")],
-            [back("home", "❌ Back To Menu")],
-            [support_button()],
-        ]
-        return await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
+        return await show(c, text, invoice_markup(track_id, invoice["payment_url"]), photo_url=IMG_BUY_GV)
 
     await alert(c, f"OxaPay Error: {inv_err or err_msg or 'Could not create payment'}")
 
 
 @user_router.callback_query(F.data.startswith("pay_panel:"))
 async def cb_pay_panel(c: CallbackQuery):
+    """Full OxaPay checkout page where the payer picks any coin."""
     _, gv_type, qty_str = c.data.split(":")
     qty = to_int(qty_str)
     if qty < 1:
@@ -818,28 +847,50 @@ async def cb_pay_panel(c: CallbackQuery):
     total_cents = unit_cents * qty
     total_usd = total_cents / 100.0
     uid = c.from_user.id
-
-    await c.answer("Creating payment invoice...")
     order_ref = new_order_ref(uid)
+
     invoice, err_msg = await create_oxapay_full_invoice(uid, total_usd, order_ref)
     if not invoice:
         return await alert(c, f"OxaPay Error: {err_msg}")
 
     track_id = str(invoice.get("track_id", ""))
-    await save_pending_payment(track_id, order_ref, uid, gv_type, qty, total_cents, "MULTI", "invoice")
+    try:
+        await save_pending_payment(track_id, order_ref, uid, gv_type, qty, total_cents, "MULTI", "invoice")
+    except Exception as e:
+        log.exception("Could not save payment: %s", e)
+        return await alert(c, "Database error - please try again in a moment.")
 
     text = (
         f"🧾 <b>Payment Invoice</b>\n\n"
         f"💵 Amount: <b>${total_usd:.2f} USD</b>\n\n"
-        "Tap <b>Pay Now</b> to choose your coin and complete the payment. "
-        "Your accounts are delivered automatically once it is confirmed."
+        "Tap <b>Pay Now</b>, choose your coin and pay. Delivery is automatic once it is confirmed."
     )
-    rows = [
-        [btn("💲 Pay Now", url=invoice["payment_url"], style="success")],
-        [back("home", "❌ Back To Menu")],
-        [support_button()],
-    ]
-    await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
+    await show(c, text, invoice_markup(track_id, invoice["payment_url"]), photo_url=IMG_BUY_GV)
+
+
+@user_router.callback_query(F.data.startswith("chk:"))
+async def cb_check_payment(c: CallbackQuery):
+    """Manual 'Check Payment' button - asks OxaPay directly, no webhook needed."""
+    track_id = c.data.split(":", 1)[1]
+    p = await db.gv_payments.find_one({"track_id": track_id, "user_id": c.from_user.id})
+    if not p:
+        return await alert(c, "Payment not found.")
+    if p["status"] == "completed":
+        return await alert(c, "✅ This payment is already confirmed and delivered.")
+    if p["status"] != "pending":
+        return await alert(c, "This payment needs support attention. Please contact support.")
+
+    info, err = await fetch_payment_info(track_id)
+    if not info:
+        return await alert(c, f"Could not check right now: {err}")
+    info["track_id"] = track_id
+    result = await process_payment_update(info)
+    msgs = {
+        "delivered": "✅ Payment confirmed! Your accounts are being delivered.",
+        "partial": "⚠️ Partial payment received. Please send the remaining amount to the same address.",
+        "review": "🔎 Payment detected and sent to support for quick verification.",
+    }
+    await alert(c, msgs.get(result, "⏳ No confirmed payment yet. Wait for blockchain confirmation and try again in a minute."))
 
 
 # ── Orders & Support ──
@@ -1152,7 +1203,7 @@ async def msg_terms_update(m: Message, state: FSMContext):
     await m.answer("✅ Terms updated successfully.", reply_markup=kb([[back("adm:home")]]))
 
 
-# ════════════════════════ OXAPAY WEBHOOK SERVER ════════════════════════
+# ════════════════════════ PAYMENT VERIFICATION (webhook + polling + button) ════════════════════════
 
 
 def verify_oxapay_hmac(body_bytes: bytes, hmac_header: Optional[str]) -> bool:
@@ -1168,15 +1219,44 @@ async def notify_admins(text: str):
         await safe_send(admin_id, text=text, parse_mode=ParseMode.HTML)
 
 
+def _dec(v: Any) -> Decimal:
+    try:
+        return Decimal(str(v)) if v not in (None, "") else Decimal(0)
+    except InvalidOperation:
+        return Decimal(0)
+
+
+PAID_TX_STATUSES = {"confirmed", "paid", "completed"}
+
+
+def extract_static_txs(data: dict) -> list[tuple[str, Decimal]]:
+    """Returns [(tx_hash, usd_value)] for confirmed incoming transactions of a static address."""
+    out: list[tuple[str, Decimal]] = []
+    for tx in data.get("txs") or []:
+        if not isinstance(tx, dict):
+            continue
+        if str(tx.get("status", "")).strip().lower() not in PAID_TX_STATUSES:
+            continue
+        val = _dec(tx.get("value") or tx.get("sent_value") or tx.get("received_value"))
+        h = str(tx.get("tx_hash") or "")
+        if val > 0 and h:
+            out.append((h, val))
+    if not out and str(data.get("status", "")).strip().lower() == "paid":
+        val = _dec(data.get("value") or data.get("sent_value"))
+        if val > 0:
+            out.append((str(data.get("tx_hash") or f"top-{data.get('date') or val}"), val))
+    return out
+
+
 async def deliver_payment(payment: dict, track_id: str):
     """Marks the payment completed (atomically, once) and delivers the stock."""
-    claimed = await db.payments.find_one_and_update(
+    claimed = await db.gv_payments.find_one_and_update(
         {"track_id": track_id, "status": "pending"},
         {"$set": {"status": "completed", "completed_at": now()}},
         return_document=ReturnDocument.BEFORE,
     )
     if not claimed:
-        return  # already processed by a previous webhook retry
+        return  # already processed by another webhook / poll / button press
 
     order, items, err = await fulfill_order(payment["user_id"], payment["gv_type"], payment["quantity"], track_id)
     if order and items:
@@ -1191,8 +1271,7 @@ async def deliver_payment(payment: dict, track_id: str):
         )
         return
 
-    # Paid but could not deliver (e.g. stock ran out) -> flag it, never lose the sale silently
-    await db.payments.update_one({"track_id": track_id}, {"$set": {"status": "paid_unfulfilled", "error": err}})
+    await db.gv_payments.update_one({"track_id": track_id}, {"$set": {"status": "paid_unfulfilled", "error": err}})
     await safe_send(
         payment["user_id"],
         text="⚠️ <b>Payment received</b>, but we could not deliver your order automatically. Support has been notified and will fix this shortly.",
@@ -1203,73 +1282,109 @@ async def deliver_payment(payment: dict, track_id: str):
     )
 
 
+async def process_payment_update(data: dict) -> str:
+    """
+    Single entry point used by the webhook, the background poller and the Check Payment button.
+    `data` must contain track_id + OxaPay payment fields.
+    Returns: ignored | waiting | partial | review | delivered
+    """
+    track_id = str(data.get("track_id") or data.get("trackId") or "")
+    if not track_id:
+        return "ignored"
+    payment = await db.gv_payments.find_one({"track_id": track_id})
+    if not payment or payment.get("status") != "pending":
+        return "ignored"
+
+    status = str(data.get("status", "")).strip().lower()
+
+    if payment.get("kind") == "invoice":
+        if status != "paid":
+            return "waiting"
+        await deliver_payment(payment, track_id)
+        return "delivered"
+
+    # Static address: any amount can arrive, so verify the confirmed USD value.
+    txs = extract_static_txs(data)
+    if not txs:
+        if status == "paid":
+            first = await db.gv_payments.find_one_and_update(
+                {"track_id": track_id, "review_notified": {"$ne": True}}, {"$set": {"review_notified": True}}
+            )
+            if first:
+                await notify_admins(
+                    f"⚠️ <b>Static payment needs manual review</b>\nTrack ID: <code>{track_id}</code>\n"
+                    f"User: <code>{payment['user_id']}</code>\nPayload: <code>{esc(json.dumps(data, default=str)[:900])}</code>"
+                )
+            return "review"
+        return "waiting"
+
+    updated = payment
+    added = False
+    for tx_hash, value in txs:
+        if tx_hash in updated.get("tx_hashes", []):
+            continue
+        res = await db.gv_payments.find_one_and_update(
+            {"track_id": track_id, "status": "pending", "tx_hashes": {"$ne": tx_hash}},
+            {"$inc": {"received_usd": float(value)}, "$addToSet": {"tx_hashes": tx_hash}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if res:
+            updated = res
+            added = True
+    if not added:
+        return "waiting"
+
+    expected = Decimal(updated["amount_cents"]) / 100
+    total = Decimal(str(updated["received_usd"]))
+    if total < expected * (1 - UNDERPAY_TOLERANCE):
+        await safe_send(
+            updated["user_id"],
+            text=(
+                f"⚠️ <b>Partial payment received</b>: ${total:.2f} of ${expected:.2f}.\n"
+                f"Please send the remaining <b>${expected - total:.2f}</b> to the same address to complete your order."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return "partial"
+
+    await deliver_payment(updated, track_id)
+    return "delivered"
+
+
 async def handle_oxapay_webhook(request):
-    """Receives OxaPay payment webhooks and fulfills orders automatically."""
+    """Receives OxaPay webhooks (needs a Heroku *web* dyno)."""
     try:
         raw_body = await request.read()
         if not verify_oxapay_hmac(raw_body, request.headers.get("HMAC")):
             log.warning("Webhook rejected: bad or missing HMAC signature.")
             return web.json_response({"status": "unauthorized"}, status=401)
-
         data = json.loads(raw_body.decode("utf-8"))
         log.info("OxaPay webhook: %s", data)
-
-        status = str(data.get("status", "")).strip().lower()
-        track_id = str(data.get("track_id") or data.get("trackId") or "")
-        if status != "paid" or not track_id:
-            return web.json_response({"status": "ok"})
-
-        payment = await db.payments.find_one({"track_id": track_id})
-        if not payment or payment.get("status") != "pending":
-            return web.json_response({"status": "ok"})
-
-        if payment.get("kind") == "static":
-            # A static address accepts ANY amount, so verify what was actually received.
-            try:
-                received = Decimal(str(data.get("value") or data.get("sent_value") or 0))
-            except InvalidOperation:
-                received = Decimal(0)
-            if received <= 0:
-                log.warning("Static payment %s: could not read USD value from webhook - manual review", track_id)
-                await notify_admins(
-                    f"⚠️ <b>Static payment needs manual review</b>\nTrack ID: <code>{track_id}</code>\n"
-                    f"User: <code>{payment['user_id']}</code>\nPayload: <code>{esc(json.dumps(data)[:900])}</code>"
-                )
-                return web.json_response({"status": "ok"})
-
-            txs = data.get("txs") or []
-            tx_hash = str(data.get("tx_hash") or (txs[-1].get("tx_hash") if txs and isinstance(txs[-1], dict) else "") or f"nohash-{raw_body[:32].hex()}")
-            if tx_hash in payment.get("tx_hashes", []):
-                return web.json_response({"status": "ok"})  # duplicate delivery of the same tx
-
-            updated = await db.payments.find_one_and_update(
-                {"track_id": track_id, "status": "pending"},
-                {"$inc": {"received_usd": float(received)}, "$addToSet": {"tx_hashes": tx_hash}},
-                return_document=ReturnDocument.AFTER,
-            )
-            if not updated:
-                return web.json_response({"status": "ok"})
-
-            expected = Decimal(updated["amount_cents"]) / 100
-            total = Decimal(str(updated["received_usd"]))
-            if total < expected * (1 - UNDERPAY_TOLERANCE):
-                remaining = expected - total
-                await safe_send(
-                    payment["user_id"],
-                    text=(
-                        f"⚠️ <b>Partial payment received</b>: ${total:.2f} of ${expected:.2f}.\n"
-                        f"Please send the remaining <b>${remaining:.2f}</b> to the same address to complete your order."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-                return web.json_response({"status": "ok"})
-            payment = updated
-
-        await deliver_payment(payment, track_id)
+        result = await process_payment_update(data)
+        log.info("Webhook result for %s: %s", data.get("track_id"), result)
         return web.json_response({"status": "ok"})
     except Exception as e:
         log.exception("OxaPay webhook error: %s", e)
         return web.json_response({"status": "error"}, status=400)
+
+
+async def payment_poller():
+    """Safety net: every 45s re-checks pending payments directly with OxaPay, so delivery works even if a webhook is lost."""
+    while True:
+        try:
+            await asyncio.sleep(45)
+            cutoff = now() - timedelta(hours=12)
+            pending = await db.gv_payments.find({"status": "pending", "created_at": {"$gt": cutoff}}).limit(100).to_list(100)
+            for p in pending:
+                info, _err = await fetch_payment_info(p["track_id"])
+                if info:
+                    info["track_id"] = p["track_id"]
+                    await process_payment_update(info)
+                await asyncio.sleep(0.3)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("Payment poller error: %s", e)
 
 
 # ════════════════════════ APPLICATION ENTRY ════════════════════════
@@ -1299,11 +1414,13 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
+    poller = asyncio.create_task(payment_poller())
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         log.info("Bot started with OxaPay Automatic Crypto Processing and Gemini AI Parser.")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        poller.cancel()
         await bot.session.close()
         mongo.close()
 

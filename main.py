@@ -47,7 +47,8 @@ ADMIN_SET = set(config.ADMIN_IDS)
 PAGE_10 = 10
 MAX_PRICE_CENTS = 10_000_000
 
-# Overridden active credentials for guaranteed OxaPay integration
+# Overridden active credentials for OxaPay integration
+# NOTE: Ensure OXAPAY_MERCHANT_KEY comes from OxaPay Dashboard -> Merchants -> Merchant Key
 OXAPAY_MERCHANT_KEY = getattr(config, "OXAPAY_MERCHANT_KEY", "OXAIYylhi8ve5wkG7H5q5PCDgL")
 OXAPAY_API_KEY = getattr(config, "OXAPAY_API_KEY", "SLXIKW-1VLVHO-YDNVDP-ZPDOEW")
 
@@ -162,7 +163,7 @@ async def create_oxapay_static_address(user_id: int, currency: str, amount_usd: 
                 data = await resp.json()
                 if data.get("result") == 100:
                     return data, ""
-                err_msg = data.get("message", json.dumps(data))
+                err_msg = data.get("message", f"Code {data.get('result')}")
                 log.error("OxaPay Address Error details: %s", data)
                 return None, err_msg
     except Exception as e:
@@ -193,7 +194,7 @@ async def create_oxapay_full_invoice(user_id: int, amount_usd: float, currency: 
                 data = await resp.json()
                 if data.get("result") == 100:
                     return data, ""
-                err_msg = data.get("message", json.dumps(data))
+                err_msg = data.get("message", f"Code {data.get('result')}")
                 log.error("OxaPay Invoice Error details: %s", data)
                 return None, err_msg
     except Exception as e:
@@ -741,8 +742,8 @@ async def cb_pay_auto(c: CallbackQuery):
         ]
         return await show(c, text, kb(rows), photo_url=IMG_BUY_GV)
 
-    # Show exact failure message instead of hanging
-    await alert(c, f"OxaPay Error: {err_msg or inv_err or 'Check currency support in merchant settings'}")
+    # Show exact failure message pop-up
+    await alert(c, f"OxaPay Error: {err_msg or inv_err or 'Invalid key or endpoint issue'}")
 
 
 @user_router.callback_query(F.data.startswith("pay_panel:"))
@@ -756,7 +757,7 @@ async def cb_pay_panel(c: CallbackQuery):
     invoice, err_msg = await create_oxapay_full_invoice(c.from_user.id, total_usd)
 
     if not invoice or not invoice.get("payLink"):
-        return await alert(c, f"OxaPay Error: {err_msg or 'Could not generate payment invoice'}")
+        return await alert(c, f"OxaPay Error: {err_msg or 'Could not generate invoice'}")
 
     pay_link = invoice["payLink"]
     track_id = str(invoice.get("trackId", ""))

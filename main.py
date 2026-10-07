@@ -54,6 +54,13 @@ def _cfg(name: str) -> str:
     val = getattr(config, name, None) or os.environ.get(name) or ""
     return str(val).strip()
 
+def get_emoji(emoji_attr: str, fallback_str: str) -> Text:
+    """Helper to return CustomEmoji if ID exists in config, otherwise standard string."""
+    emoji_id = getattr(config, emoji_attr, None)
+    if emoji_id:
+        return Text(CustomEmoji(fallback_str, custom_emoji_id=str(emoji_id)))
+    return Text(fallback_str)
+
 
 OXAPAY_API_KEY = _cfg("OXAPAY_API_KEY") or _cfg("OXAPAY_MERCHANT_KEY") or _cfg("OXAPAY_MERCHANT_API_KEY")
 WEBHOOK_BASE = _cfg("WEBHOOK_URL").rstrip("/")
@@ -374,8 +381,8 @@ def pager(prefix: str, page: int, pages: int) -> list:
 def main_menu(admin: bool, user_balance: int = 0) -> InlineKeyboardMarkup:
     rows = [
         [btn("🛍 Buy Google Voice", "pl:0", "success")],
-        [btn("📦 My Orders", "ol:0", "primary"), btn("💳 Top-Up Wallet", "topup_wallet", "success")],
-        [btn("💬 Contact Support", "sup", "success"), btn("📜 Terms", "terms", "primary")],
+        [btn("👛 Wallet", "topup_wallet", "success"), btn("📦 My Orders", "ol:0", "primary")],
+        [btn("🎧 Contact Support", "sup", "success"), btn("📜 Terms", "terms", "primary")],
     ]
     if admin:
         rows.append([btn("⚙️ Admin Panel", "adm:home", "primary")])
@@ -424,7 +431,7 @@ async def safe_send(chat_id: int, **kw):
 
 
 async def notify_admins(text: str = None, content: Optional[Text] = None, markup=None):
-    kw = content.as_kwargs() if content else {"text": text}
+    kw = content.as_kwargs() if content else {"text": text, "parse_mode": ParseMode.HTML}
     if markup:
         kw["reply_markup"] = markup
     for aid in ADMIN_SET:
@@ -517,12 +524,19 @@ async def fulfill_order(user_id: int, gv_type: str, qty: int, track_id: str) -> 
     }
     await db.orders.insert_one(order)
 
+    # Fetch buyer details to display username properly
+    buyer_doc = await db.users.find_one({"user_id": user_id})
+    username_str = f"@{buyer_doc['username']}" if buyer_doc and buyer_doc.get("username") else "NoUser"
+    rem_balance = buyer_doc.get("balance_cents", 0) if buyer_doc else 0
+
+    # Fixed Admin Alert using properly structured Aiogram Formatting Text object
     admin_alert = Text(
-        CustomEmoji("🛍", custom_emoji_id=getattr(config, "STORE_EMOJI_ID", "5373142232980331089")), " ", Bold("Order Fulfilled!"), "\n\n",
-        f"<b>Order ID:</b> <code>{oid}</code>\n",
-        f"<b>Buyer ID:</b> <code>{user_id}</code>\n",
-        f"<b>Product:</b> {gv_title} x{qty}\n",
-        f"<b>Amount Paid:</b> {money(total_cents)}"
+        get_emoji("STORE_EMOJI_ID", "🛍"), " ", Bold("New Product Purchase!"), "\n\n",
+        Bold("Order ID: "), f" {oid}\n",
+        Bold("Buyer: "), f" {username_str} (ID: {user_id})\n",
+        Bold("Product: "), f" {gv_title} x{qty}\n",
+        Bold("Price Paid: "), f" {money(total_cents)}\n",
+        Bold("Remaining User Balance: "), f" {money(rem_balance)}"
     )
     await notify_admins(content=admin_alert)
 
@@ -627,8 +641,8 @@ async def cb_home(c: CallbackQuery, state: FSMContext):
     user_bal = await get_user_balance(c.from_user.id)
     welcome_text = (
         f"🎁 <b>Welcome to {config.STORE_NAME}</b>\n\n"
-        f"💳 Your Wallet Balance: <b>{money(user_bal)}</b>\n\n"
-        "Select an option below to browse products or complete orders."
+        f"💳 Your Balance: <b>{money(user_bal)}</b>\n\n"
+        "Select an option below to browse products or top up your balance."
     )
     await show(c, welcome_text, main_menu(c.from_user.id in ADMIN_SET, user_bal), photo_url=IMG_WELCOME)
 
@@ -916,31 +930,28 @@ async def cb_buy_with_balance(c: CallbackQuery):
         item_block = delivery_block(items[0])
         text = (
             f"✅ <b>Purchase Successful!</b>\n\n"
-            f"<b>Order ID: {order['order_id']}</b>\n"
-            f"<b>Amount Deducted: {money(total_cents)}</b>\n\n"
-            f"<b>Delivered Account Details:</b>\n"
+            f"<b>Order ID:</b> <code>{order['order_id']}</code>\n"
+            f"<b>Amount Deducted:</b> {money(total_cents)}\n\n"
             f"🔑 <b>Account Details:</b>\n"
             f"<pre>{item_block}</pre>\n\n"
             f"<i>if you encounter any issues while logging in, please contact the support line immediately.</i>"
         )
         await show(c, text, order_markup)
     else:
-        # Multiple items: edit current menu message with summary then send individual messages
         summary_text = (
             f"✅ <b>Purchase Successful!</b>\n\n"
-            f"<b>Order ID: {order['order_id']}</b>\n"
-            f"<b>Amount Deducted: {money(total_cents)}</b>\n"
-            f"<b>Accounts Purchased: {len(items)}</b>\n\n"
+            f"<b>Order ID:</b> <code>{order['order_id']}</code>\n"
+            f"<b>Amount Deducted:</b> {money(total_cents)}\n"
+            f"<b>Accounts Purchased:</b> {len(items)}\n\n"
             f"📩 <i>Sending your {len(items)} separate Google Voice account details below...</i>"
         )
         await show(c, summary_text, order_markup)
 
-        # Send 1 message per GV account
         for idx, item in enumerate(items, 1):
             item_block = delivery_block(item)
             single_msg = (
                 f"✅ <b>Google Voice Account #{idx} of {len(items)}</b>\n"
-                f"<b>Order ID: {order['order_id']}</b>\n\n"
+                f"<b>Order ID:</b> <code>{order['order_id']}</code>\n\n"
                 f"🔑 <b>Account Details:</b>\n"
                 f"<pre>{item_block}</pre>\n\n"
                 f"<i>if you encounter any issues while logging in, please contact the support line immediately.</i>"
@@ -1042,11 +1053,10 @@ async def cb_order_view(c: CallbackQuery):
     delivered_text = "\n\n".join(delivered_blocks)
 
     text = (
-        f"✅ <b>Purchase Successful!</b>\n\n"
-        f"<b>Order ID: {o['order_id']}</b>\n"
-        f"<b>Amount Deducted: {money(o['amount_cents'])}</b>\n\n"
-        f"<b>Delivered Account Details:</b>\n"
-        f"🔑 <b>Account Details:</b>\n"
+        f"✅ <b>Purchase Details:</b>\n\n"
+        f"<b>Order ID:</b> <code>{o['order_id']}</code>\n"
+        f"<b>Amount Paid:</b> {money(o['amount_cents'])}\n\n"
+        f"🔑 <b>Delivered Account Details:</b>\n"
         f"{delivered_text}\n\n"
         f"<i>if you encounter any issues while logging in, please contact the support line immediately.</i>"
     )
@@ -1501,9 +1511,9 @@ async def credit_user_wallet(payment: dict, track_id: str):
     )
 
     admin_alert = Text(
-        CustomEmoji("💳", custom_emoji_id=getattr(config, "STORE_EMOJI_ID", "5373142232980331089")), " ", Bold("Wallet Top-Up Confirmed!"), "\n\n",
-        f"<b>User ID:</b> <code>{uid}</code>\n",
-        f"<b>Amount Topped Up:</b> {money(amount_cents)}"
+        get_emoji("WALLET_EMOJI_ID", "💳"), " ", Bold("Wallet Top-Up Confirmed!"), "\n\n",
+        Bold("User ID: "), f" {uid}\n",
+        Bold("Amount Topped Up: "), f" {money(amount_cents)}"
     )
     await notify_admins(content=admin_alert)
 
